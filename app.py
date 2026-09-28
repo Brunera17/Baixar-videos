@@ -51,16 +51,21 @@ def opcoes_formato(qualidade):
             }],
         }
     altura = QUALIDADES[qualidade]
-    filtro = f"[height<={altura}]" if altura else ""
-    # H.264 (avc1) primeiro porque abre em qualquer player. Na "Melhor qualidade" não,
-    # porque acima de 1080p o YouTube só oferece VP9/AV1 e o 4K seria ignorado.
-    preferir_h264 = f"bestvideo{filtro}[vcodec^=avc1]+bestaudio[ext=m4a]/" if altura else ""
+    if altura is None:
+        # Sem filtro de codec/contêiner: acima de 1080p o YouTube costuma oferecer só
+        # VP9 (webm) ou AV1, e qualquer preferência por mp4 faria o 4K ser ignorado
+        formato = "bestvideo+bestaudio/best"
+    else:
+        # H.264 (avc1) primeiro porque abre em qualquer player
+        filtro = f"[height<={altura}]"
+        formato = (
+            f"bestvideo{filtro}[vcodec^=avc1]+bestaudio[ext=m4a]"
+            f"/bestvideo{filtro}[ext=mp4]+bestaudio[ext=m4a]"
+            f"/bestvideo{filtro}+bestaudio/best{filtro}"
+        )
     return {
         # O YouTube entrega vídeo e áudio separados; o ffmpeg junta os dois em um .mp4
-        "format": (
-            f"{preferir_h264}bestvideo{filtro}[ext=mp4]+bestaudio[ext=m4a]"
-            f"/bestvideo{filtro}+bestaudio/best{filtro}"
-        ),
+        "format": formato,
         "merge_output_format": "mp4",
     }
 
