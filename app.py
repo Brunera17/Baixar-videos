@@ -271,8 +271,8 @@ def baixar(url, fila, qualidade="Melhor qualidade", pasta=None, cancelar=None):
     """Baixa o vídeo de forma bloqueante, mandando atualizações para a interface pela fila.
 
     O chamador deve rodar esta função em uma thread separada. Sempre termina com
-    uma mensagem "fim" na fila, mesmo em caso de erro ou cancelamento. Para cancelar,
-    o chamador liga o threading.Event `cancelar`.
+    uma mensagem ("fim", resultado, texto), com resultado "Concluído", "Cancelado" ou
+    "Erro". Para cancelar, o chamador liga o threading.Event `cancelar`.
     """
     pasta = Path(pasta) if pasta else pasta_padrao()
     cancelar = cancelar or threading.Event()
@@ -345,16 +345,16 @@ def baixar(url, fila, qualidade="Melhor qualidade", pasta=None, cancelar=None):
         # O clique em Cancelar pode chegar enquanto o ffmpeg roda, antes de o botão ser
         # desabilitado; nesse caso o cancelamento vale e o arquivo final também é apagado
         conferir_cancelamento()
-        fila.put(("fim", True, f"Concluído: {info.get('title', 'vídeo')}"))
+        fila.put(("fim", "Concluído", f"Concluído: {info.get('title', 'vídeo')}"))
     except Exception as e:
         # Se o usuário pediu para cancelar, qualquer erro que veio junto é consequência disso
         if cancelar.is_set():
             if limpeza["nome_base"]:
                 apagar_parciais(pasta, limpeza["nome_base"], limpeza["existentes"])
-            fila.put(("fim", False, "Download cancelado."))
+            fila.put(("fim", "Cancelado", "Download cancelado."))
             return
         registrar_erro(url, e)
-        fila.put(("fim", False, mensagem_erro(e)))
+        fila.put(("fim", "Erro", mensagem_erro(e)))
 
 
 class App(tk.Tk):
@@ -574,16 +574,13 @@ class App(tk.Tk):
                 if not (self.evento_cancelar.is_set() and tipo != "fim"):
                     self.status.config(text=texto)
                 if tipo == "fim":
-                    if valor:
-                        estado = "Concluído"
-                    elif self.evento_cancelar.is_set():
-                        estado = "Cancelado"
-                    else:
-                        estado = "Erro"
+                    # O resultado vem do próprio download: um clique em Cancelar depois que
+                    # ele já terminou (antes de a janela ler esta mensagem) não muda nada
+                    estado = valor
                     self.resumo[estado] += 1
                     self.itens[self.atual]["mensagem"] = texto
                     self.definir_estado(self.atual, estado)
-                    self.barra["value"] = 100 if valor else 0
+                    self.barra["value"] = 100 if estado == "Concluído" else 0
                     self.proximo()
                     return
         except queue.Empty:
