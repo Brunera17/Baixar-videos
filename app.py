@@ -17,6 +17,9 @@ from tkinter import filedialog
 import imageio_ffmpeg
 import ttkbootstrap as tb
 
+# Versão do app; o build.bat lê daqui para dar nome ao instalador
+VERSAO_APP = "1.0.0"
+
 # Onde o app guarda as preferências (hoje, só a última pasta escolhida)
 ARQUIVO_CONFIG = Path(os.environ.get("APPDATA", Path.home())) / "BaixarVideos" / "config.json"
 # Erros técnicos completos, para diagnóstico
@@ -671,7 +674,7 @@ class App(tb.App):
         tb.Separator(quadro).pack(fill="x", pady=(14, 8))
         rodape = tb.Frame(quadro)
         rodape.pack(fill="x")
-        tb.Label(rodape, text=f"yt-dlp {yt_dlp.version.__version__}", bootstyle="secondary",
+        tb.Label(rodape, text=f"v{VERSAO_APP} · yt-dlp {yt_dlp.version.__version__}", bootstyle="secondary",
                  font=("Segoe UI", 8)).pack(side="left")
         self.aviso = tb.Label(rodape, text=AVISO_YT_DLP or "", wraplength=300)
         self.aviso.pack(side="left", padx=8)

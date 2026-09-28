@@ -11,3 +11,6 @@ downloads/
 build/
 dist/
 *.spec
+
+# Instalador gerado (build.bat instalador)
+instalador/saida/
