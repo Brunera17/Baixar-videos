@@ -352,22 +352,40 @@ def instalar_yt_dlp(versao):
             pacotes.append(ler_pypi("yt-dlp-ejs", ejs.group(1)))
             break
 
-    destino = PASTA_ATUALIZACOES / f"yt-dlp-{versao}"
+    # Nome único: a versão que está valendo agora nunca é apagada antes de a nova estar pronta
+    sufixo = os.urandom(4).hex()
+    destino = PASTA_ATUALIZACOES / f"yt-dlp-{versao}-{sufixo}"
     temporaria = destino.with_name(destino.name + ".baixando")
-    shutil.rmtree(temporaria, ignore_errors=True)
     for pacote in pacotes:
         # .whl é um zip; os pacotes são Python puro, então basta extrair
         with zipfile.ZipFile(io.BytesIO(baixar_wheel(pacote))) as whl:
-            whl.extractall(temporaria)
-    shutil.rmtree(destino, ignore_errors=True)
+            extrair_com_seguranca(whl, temporaria)
     temporaria.rename(destino)
-    (PASTA_ATUALIZACOES / "atual.json").write_text(
-        json.dumps({"versao": versao, "pasta": destino.name}), encoding="utf-8")
 
-    # Versões antigas: apaga todas, menos a nova e a que este processo está usando
+    # Troca atômica: quem abrir o app vê o atual.json antigo ou o novo, nunca um pela metade
+    provisorio = PASTA_ATUALIZACOES / f"atual.json.{sufixo}.tmp"
+    provisorio.write_text(json.dumps({"versao": versao, "pasta": destino.name}), encoding="utf-8")
+    os.replace(provisorio, PASTA_ATUALIZACOES / "atual.json")
+
+    # Só agora limpa o resto (versões antigas, sobras de tentativas interrompidas),
+    # menos a nova e a que este processo está usando
     for pasta in PASTA_ATUALIZACOES.iterdir():
         if pasta.is_dir() and pasta not in (destino, PASTA_EM_USO):
             shutil.rmtree(pasta, ignore_errors=True)
+
+
+def extrair_com_seguranca(whl, destino):
+    """Extrai o .whl recusando entradas que escapariam de `destino` (../, caminho absoluto).
+
+    O extractall do Python já neutraliza esses caminhos; a checagem explícita deixa isso
+    garantido aqui, sem depender de detalhe de implementação.
+    """
+    raiz = Path(destino).resolve()
+    for membro in whl.infolist():
+        alvo = (raiz / membro.filename).resolve()
+        if alvo != raiz and raiz not in alvo.parents:
+            raise ValueError(f"Entrada insegura no pacote: {membro.filename}")
+    whl.extractall(raiz)
 
 
 def reiniciar_app():
@@ -380,7 +398,9 @@ def reiniciar_app():
     else:
         comando = [sys.executable, os.path.abspath(sys.argv[0])]
         ambiente = None
-    subprocess.Popen(comando, env=ambiente)
+    # Lista de argumentos sem shell=True: nada é interpretado por um shell, e os valores vêm do
+    # próprio processo (caminho do .exe / do Python e deste script), não do usuário nem da internet
+    subprocess.Popen(comando, env=ambiente, shell=False)
 
 
 def extrair_links(texto):
