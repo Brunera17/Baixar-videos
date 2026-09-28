@@ -1,15 +1,17 @@
+import json
 import os
 import queue
 import sys
 import threading
 import tkinter as tk
 from pathlib import Path
-from tkinter import ttk
+from tkinter import filedialog, ttk
 
 import imageio_ffmpeg
 import yt_dlp
 
-PASTA_DOWNLOADS = Path.home() / "Downloads"
+# Onde o app guarda as preferências (hoje, só a última pasta escolhida)
+ARQUIVO_CONFIG = Path(os.environ.get("APPDATA", Path.home())) / "BaixarVideos" / "config.json"
 
 SO_AUDIO = "Só áudio (MP3)"
 # Opção do menu -> altura máxima do vídeo (None = sem limite)
@@ -36,6 +38,51 @@ def caminho_deno():
         return os.path.join(sys._MEIPASS, "deno.exe")
     import deno
     return deno.find_deno_bin()
+
+
+def pasta_padrao():
+    """Pasta Downloads do Windows, mesmo se o usuário a moveu (ex.: para o OneDrive)."""
+    try:
+        import ctypes
+        from ctypes import wintypes
+        from uuid import UUID
+
+        class GUID(ctypes.Structure):
+            _fields_ = [("bytes", ctypes.c_ubyte * 16)]
+
+        guid = GUID()
+        guid.bytes[:] = UUID("{374DE290-123F-4565-9164-39C4925E467B}").bytes_le  # FOLDERID_Downloads
+        caminho = ctypes.c_wchar_p()
+        shell32 = ctypes.windll.shell32
+        shell32.SHGetKnownFolderPath.argtypes = [
+            ctypes.POINTER(GUID), wintypes.DWORD, wintypes.HANDLE, ctypes.POINTER(ctypes.c_wchar_p)]
+        if shell32.SHGetKnownFolderPath(ctypes.byref(guid), 0, None, ctypes.byref(caminho)) == 0:
+            resultado = Path(caminho.value)
+            ctypes.windll.ole32.CoTaskMemFree(caminho)
+            return resultado
+    except (AttributeError, OSError, ValueError):
+        pass
+    return Path.home() / "Downloads"
+
+
+def carregar_pasta():
+    """Última pasta escolhida, ou a padrão se não houver uma salva ou ela não existir mais."""
+    try:
+        pasta = Path(json.loads(ARQUIVO_CONFIG.read_text(encoding="utf-8"))["pasta"])
+        if pasta.is_dir():
+            return pasta
+    except (OSError, ValueError, KeyError, TypeError):
+        pass
+    return pasta_padrao()
+
+
+def salvar_pasta(pasta):
+    """Guarda a pasta escolhida; se não der para gravar, o app só não lembra dela."""
+    try:
+        ARQUIVO_CONFIG.parent.mkdir(parents=True, exist_ok=True)
+        ARQUIVO_CONFIG.write_text(json.dumps({"pasta": str(pasta)}), encoding="utf-8")
+    except OSError:
+        pass
 
 
 def opcoes_formato(qualidade):
@@ -70,12 +117,13 @@ def opcoes_formato(qualidade):
     }
 
 
-def baixar(url, fila, qualidade="Melhor qualidade"):
+def baixar(url, fila, qualidade="Melhor qualidade", pasta=None):
     """Baixa o vídeo de forma bloqueante, mandando atualizações para a interface pela fila.
 
     O chamador deve rodar esta função em uma thread separada. Sempre termina com
     uma mensagem "fim" na fila, mesmo em caso de erro.
     """
+    pasta = Path(pasta) if pasta else pasta_padrao()
     partes = {"atual": 0}
 
     def progresso(d):
@@ -106,7 +154,7 @@ def baixar(url, fila, qualidade="Melhor qualidade"):
             "ffmpeg_location": imageio_ffmpeg.get_ffmpeg_exe(),
             # Deno embutido resolve o JavaScript do YouTube, sem exigir nada instalado no PC
             "js_runtimes": {"deno": {"path": caminho_deno()}},
-            "outtmpl": str(PASTA_DOWNLOADS / "%(title)s.%(ext)s"),
+            "outtmpl": str(pasta / "%(title)s.%(ext)s"),
             "noplaylist": True,
             "quiet": True,
             "no_warnings": True,
@@ -125,10 +173,11 @@ class App(tk.Tk):
     def __init__(self):
         super().__init__()
         self.title("Baixar Vídeos")
-        self.geometry("520x200")
+        self.minsize(520, 0)
         self.resizable(False, False)
         self.fila = queue.Queue()
         self.baixando = False
+        self.pasta = carregar_pasta()
 
         quadro = ttk.Frame(self, padding=16)
         quadro.pack(fill="both", expand=True)
@@ -148,15 +197,39 @@ class App(tk.Tk):
         self.botao.pack(side="left", padx=8)
         ttk.Button(botoes, text="Abrir pasta", command=self.abrir_pasta).pack(side="left")
 
+        destino = ttk.Frame(quadro)
+        destino.pack(fill="x", pady=(8, 0))
+        self.botao_pasta = ttk.Button(destino, text="Salvar em...", command=self.escolher_pasta)
+        self.botao_pasta.pack(side="left")
+        self.rotulo_pasta = ttk.Label(destino, foreground="gray")
+        self.rotulo_pasta.pack(side="left", padx=8)
+        self.mostrar_pasta()
+
         self.barra = ttk.Progressbar(quadro, maximum=100)
         self.barra.pack(fill="x", pady=(12, 4))
-        self.status = ttk.Label(quadro, text=f"Os arquivos são salvos em {PASTA_DOWNLOADS}")
+        self.status = ttk.Label(quadro, text="Pronto.")
         self.status.pack(anchor="w")
+
+    def mostrar_pasta(self):
+        texto = str(self.pasta)
+        # Caminhos longos são cortados no meio para caber na janela
+        if len(texto) > 55:
+            texto = texto[:20] + "…" + texto[-34:]
+        self.rotulo_pasta.config(text=texto)
+
+    def escolher_pasta(self):
+        escolhida = filedialog.askdirectory(
+            parent=self, initialdir=self.pasta, title="Escolha onde salvar os downloads")
+        if not escolhida:  # usuário cancelou
+            return
+        self.pasta = Path(escolhida)
+        salvar_pasta(self.pasta)
+        self.mostrar_pasta()
 
     def abrir_pasta(self):
         try:
-            PASTA_DOWNLOADS.mkdir(parents=True, exist_ok=True)
-            os.startfile(PASTA_DOWNLOADS)
+            self.pasta.mkdir(parents=True, exist_ok=True)
+            os.startfile(self.pasta)
         except OSError as e:
             self.status.config(text=f"Não foi possível abrir a pasta: {e}")
 
@@ -172,8 +245,9 @@ class App(tk.Tk):
         self.botao.config(state="disabled")
         self.url.config(state="disabled")
         self.qualidade.config(state="disabled")
+        self.botao_pasta.config(state="disabled")
         self.barra["value"] = 0
-        args = (url, self.fila, self.qualidade.get())
+        args = (url, self.fila, self.qualidade.get(), self.pasta)
         threading.Thread(target=baixar, args=args, daemon=True).start()
         self.after(100, self.atualizar)
 
@@ -190,6 +264,7 @@ class App(tk.Tk):
                     self.botao.config(state="normal")
                     self.url.config(state="normal")
                     self.qualidade.config(state="readonly")
+                    self.botao_pasta.config(state="normal")
                     self.baixando = False
                     return
         except queue.Empty:
