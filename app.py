@@ -1,6 +1,7 @@
 import json
 import os
 import queue
+import re
 import sys
 import threading
 import tkinter as tk
@@ -255,12 +256,23 @@ def apagar_parciais(pasta, nome_base, existentes):
                 pass
 
 
+def extrair_links(texto):
+    """Links encontrados no texto colado, na ordem, sem repetir.
+
+    Aceita um por linha, vários na mesma linha ou links no meio de outro texto.
+    """
+    links = re.findall(r"(?:https?://|www\.)[^\s<>\"']+", texto)
+    # Pontuação colada no fim ("veja https://...,") não faz parte do link
+    links = [link.rstrip(".,;:!?)]}") for link in links]
+    return list(dict.fromkeys(links))
+
+
 def baixar(url, fila, qualidade="Melhor qualidade", pasta=None, cancelar=None):
     """Baixa o vídeo de forma bloqueante, mandando atualizações para a interface pela fila.
 
     O chamador deve rodar esta função em uma thread separada. Sempre termina com
-    uma mensagem "fim" na fila, mesmo em caso de erro ou cancelamento. Para cancelar,
-    o chamador liga o threading.Event `cancelar`.
+    uma mensagem ("fim", resultado, texto), com resultado "Concluído", "Cancelado" ou
+    "Erro". Para cancelar, o chamador liga o threading.Event `cancelar`.
     """
     pasta = Path(pasta) if pasta else pasta_padrao()
     cancelar = cancelar or threading.Event()
@@ -333,16 +345,16 @@ def baixar(url, fila, qualidade="Melhor qualidade", pasta=None, cancelar=None):
         # O clique em Cancelar pode chegar enquanto o ffmpeg roda, antes de o botão ser
         # desabilitado; nesse caso o cancelamento vale e o arquivo final também é apagado
         conferir_cancelamento()
-        fila.put(("fim", True, f"Concluído: {info.get('title', 'vídeo')}"))
+        fila.put(("fim", "Concluído", f"Concluído: {info.get('title', 'vídeo')}"))
     except Exception as e:
         # Se o usuário pediu para cancelar, qualquer erro que veio junto é consequência disso
         if cancelar.is_set():
             if limpeza["nome_base"]:
                 apagar_parciais(pasta, limpeza["nome_base"], limpeza["existentes"])
-            fila.put(("fim", False, "Download cancelado."))
+            fila.put(("fim", "Cancelado", "Download cancelado."))
             return
         registrar_erro(url, e)
-        fila.put(("fim", False, mensagem_erro(e)))
+        fila.put(("fim", "Erro", mensagem_erro(e)))
 
 
 class App(tk.Tk):
@@ -352,25 +364,29 @@ class App(tk.Tk):
         self.minsize(520, 0)
         self.resizable(False, False)
         self.fila = queue.Queue()
-        self.baixando = False
+        self.itens = {}  # id da linha na lista -> url, qualidade, pasta e mensagem final
+        self.pendentes = []  # ids na ordem em que vão ser baixados
+        self.atual = None  # id do item que está baixando agora
+        self.resumo = {"Concluído": 0, "Erro": 0, "Cancelado": 0}
         self.evento_cancelar = threading.Event()
         self.pasta = carregar_pasta()
 
         quadro = ttk.Frame(self, padding=16)
         quadro.pack(fill="both", expand=True)
 
-        ttk.Label(quadro, text="Cole o link do vídeo:").pack(anchor="w")
-        self.url = ttk.Entry(quadro)
-        self.url.pack(fill="x", pady=(4, 8))
-        self.url.focus()
-        self.url.bind("<Return>", lambda _: self.iniciar())
+        ttk.Label(quadro, text="Cole um ou mais links (um por linha):").pack(anchor="w")
+        self.links = tk.Text(quadro, height=3, wrap="none", font=("Segoe UI", 9), undo=True)
+        self.links.pack(fill="x", pady=(4, 8))
+        self.links.focus()
+        # Enter sozinho pula linha (para colar vários links); Ctrl+Enter adiciona à fila
+        self.links.bind("<Control-Return>", lambda _: (self.adicionar(), "break")[1])
 
         botoes = ttk.Frame(quadro)
         botoes.pack(fill="x")
         self.qualidade = ttk.Combobox(botoes, values=list(QUALIDADES), state="readonly", width=18)
         self.qualidade.current(0)
         self.qualidade.pack(side="left")
-        self.botao = ttk.Button(botoes, text="Baixar", command=self.iniciar)
+        self.botao = ttk.Button(botoes, text="Baixar", command=self.adicionar)
         self.botao.pack(side="left", padx=8)
         self.botao_cancelar = ttk.Button(botoes, text="Cancelar", command=self.cancelar, state="disabled")
         self.botao_cancelar.pack(side="left")
@@ -384,7 +400,27 @@ class App(tk.Tk):
         self.rotulo_pasta.pack(side="left", padx=8)
         self.mostrar_pasta()
 
-        # Miniatura e dados do vídeo; só aparece depois que o link é lido
+        # Fila de downloads
+        area_lista = ttk.Frame(quadro)
+        area_lista.pack(fill="x", pady=(12, 0))
+        self.lista = ttk.Treeview(
+            area_lista, columns=("video", "qualidade", "estado"), show="headings", height=5)
+        for coluna, titulo, largura in (("video", "Vídeo", 250), ("qualidade", "Qualidade", 95),
+                                        ("estado", "Situação", 105)):
+            self.lista.heading(coluna, text=titulo, anchor="w")
+            self.lista.column(coluna, width=largura, minwidth=largura, stretch=coluna == "video")
+        rolagem = ttk.Scrollbar(area_lista, orient="vertical", command=self.lista.yview)
+        self.lista.configure(yscrollcommand=rolagem.set)
+        self.lista.pack(side="left", fill="x", expand=True)
+        rolagem.pack(side="left", fill="y")
+        self.lista.bind("<<TreeviewSelect>>", self.mostrar_mensagem_item)
+
+        botoes_lista = ttk.Frame(quadro)
+        botoes_lista.pack(fill="x", pady=(4, 0))
+        ttk.Button(botoes_lista, text="Remover selecionados", command=self.remover_selecionados).pack(side="left")
+        ttk.Button(botoes_lista, text="Limpar concluídos", command=self.limpar_concluidos).pack(side="left", padx=8)
+
+        # Miniatura e dados do vídeo atual; só aparece depois que o link é lido
         self.quadro_info = ttk.Frame(quadro)
         self.miniatura = ttk.Label(self.quadro_info)
         self.miniatura.pack(side="left", padx=(0, 10))
@@ -400,6 +436,10 @@ class App(tk.Tk):
         self.barra.pack(fill="x", pady=(12, 4))
         self.status = ttk.Label(quadro, text="Pronto.", wraplength=488)
         self.status.pack(anchor="w")
+
+    @property
+    def baixando(self):
+        return self.atual is not None
 
     def mostrar_pasta(self):
         texto = str(self.pasta)
@@ -424,31 +464,82 @@ class App(tk.Tk):
         except OSError as e:
             self.status.config(text=f"Não foi possível abrir a pasta: {e}")
 
-    def iniciar(self):
-        # O Enter no campo também chama iniciar, então o bloqueio não pode depender só do botão
-        if self.baixando:
+    def definir_estado(self, iid, estado):
+        self.lista.set(iid, "estado", estado)
+
+    def adicionar(self):
+        """Coloca na fila os links da caixa de texto; começa a baixar se estiver parado."""
+        links = extrair_links(self.links.get("1.0", "end"))
+        if not links:
+            self.status.config(text="Nenhum link encontrado. Cole o endereço completo do vídeo.")
             return
-        url = self.url.get().strip()
-        if not url:
-            self.status.config(text="Cole um link primeiro.")
+        na_fila = {self.itens[i]["url"] for i in self.pendentes + [self.atual] if i}
+        novos = [link for link in links if link not in na_fila]
+        # Qualidade e pasta valem a partir de agora; itens já na fila mantêm as deles
+        for url in novos:
+            iid = self.lista.insert("", "end", values=(url, self.qualidade.get(), "Na fila"))
+            self.itens[iid] = {"url": url, "qualidade": self.qualidade.get(), "pasta": self.pasta,
+                               "mensagem": "Na fila."}
+            self.pendentes.append(iid)
+        self.links.delete("1.0", "end")
+
+        texto = f"{len(novos)} link(s) adicionado(s) à fila."
+        if len(novos) < len(links):
+            texto += f" {len(links) - len(novos)} já estava(m) na fila."
+        self.status.config(text=texto)
+        if not self.baixando and novos:
+            self.resumo = dict.fromkeys(self.resumo, 0)
+            self.proximo()
+
+    def proximo(self):
+        if not self.pendentes:
+            self.atual = None
+            self.botao_cancelar.config(state="disabled")
+            partes = [f"{self.resumo['Concluído']} baixado(s)"]
+            if self.resumo["Erro"]:
+                partes.append(f"{self.resumo['Erro']} com erro (clique no item para ver o motivo)")
+            if self.resumo["Cancelado"]:
+                partes.append(f"{self.resumo['Cancelado']} cancelado(s)")
+            self.status.config(text="Fila concluída: " + ", ".join(partes) + ".")
             return
-        self.baixando = True
-        self.botao.config(state="disabled")
-        self.url.config(state="disabled")
-        self.qualidade.config(state="disabled")
-        self.botao_pasta.config(state="disabled")
+        self.atual = self.pendentes.pop(0)
+        item = self.itens[self.atual]
+        self.definir_estado(self.atual, "Começando...")
+        self.lista.see(self.atual)
         self.botao_cancelar.config(state="normal")
         self.barra["value"] = 0
         self.quadro_info.pack_forget()
         self.evento_cancelar = threading.Event()
-        args = (url, self.fila, self.qualidade.get(), self.pasta, self.evento_cancelar)
+        args = (item["url"], self.fila, item["qualidade"], item["pasta"], self.evento_cancelar)
         threading.Thread(target=baixar, args=args, daemon=True).start()
         self.after(100, self.atualizar)
 
     def cancelar(self):
+        """Cancela só o vídeo atual; a fila continua com o próximo."""
         self.evento_cancelar.set()
         self.botao_cancelar.config(state="disabled")
         self.status.config(text="Cancelando...")
+
+    def remover_selecionados(self):
+        for iid in self.lista.selection():
+            if iid == self.atual:
+                continue  # o que está baixando se interrompe pelo Cancelar
+            if iid in self.pendentes:
+                self.pendentes.remove(iid)
+            self.itens.pop(iid, None)
+            self.lista.delete(iid)
+
+    def limpar_concluidos(self):
+        for iid in list(self.itens):
+            if iid != self.atual and iid not in self.pendentes:
+                self.itens.pop(iid)
+                self.lista.delete(iid)
+
+    def mostrar_mensagem_item(self, _evento=None):
+        selecao = self.lista.selection()
+        # Durante um download a linha de status mostra o progresso, que é mais útil
+        if len(selecao) == 1 and selecao[0] != self.atual and selecao[0] in self.itens:
+            self.status.config(text=self.itens[selecao[0]]["mensagem"])
 
     def mostrar_info(self, detalhes):
         self.rotulo_titulo.config(text=detalhes["titulo"])
@@ -473,19 +564,24 @@ class App(tk.Tk):
                     continue
                 if tipo == "info":
                     self.mostrar_info(valor)
+                    self.lista.set(self.atual, "video", valor["titulo"])
                 elif tipo == "progresso":
                     self.barra["value"] = valor
+                    etapa = "Finalizando..." if texto.startswith(("Juntando", "Convertendo")) else f"{valor:.0f}%"
+                    if not self.evento_cancelar.is_set():
+                        self.definir_estado(self.atual, etapa)
                 # Depois de pedir o cancelamento, não deixa o progresso apagar o "Cancelando..."
                 if not (self.evento_cancelar.is_set() and tipo != "fim"):
                     self.status.config(text=texto)
                 if tipo == "fim":
-                    self.barra["value"] = 100 if valor else 0
-                    self.botao.config(state="normal")
-                    self.botao_cancelar.config(state="disabled")
-                    self.url.config(state="normal")
-                    self.qualidade.config(state="readonly")
-                    self.botao_pasta.config(state="normal")
-                    self.baixando = False
+                    # O resultado vem do próprio download: um clique em Cancelar depois que
+                    # ele já terminou (antes de a janela ler esta mensagem) não muda nada
+                    estado = valor
+                    self.resumo[estado] += 1
+                    self.itens[self.atual]["mensagem"] = texto
+                    self.definir_estado(self.atual, estado)
+                    self.barra["value"] = 100 if estado == "Concluído" else 0
+                    self.proximo()
                     return
         except queue.Empty:
             pass
