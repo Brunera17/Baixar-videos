@@ -136,6 +136,7 @@ ERROS_CONHECIDOS = [
     (("premieres in", "live event will begin", "is upcoming"), "Esse vídeo ainda não foi publicado (estreia agendada)."),
     (("http error 429", "too many requests"),
      "O YouTube bloqueou temporariamente por excesso de pedidos. Tente de novo mais tarde."),
+    (("http error 403",), "O YouTube recusou o download agora. Tente de novo em alguns minutos."),
     (("video unavailable", "video is unavailable", "has been removed", "no longer available"),
      "Vídeo indisponível: foi removido ou o link está errado."),
     (("requested format is not available",), "A qualidade escolhida não está disponível para esse vídeo."),
@@ -233,13 +234,23 @@ def baixar_miniatura(ydl, info):
         return None
 
 
-def apagar_parciais(arquivos):
-    """Remove o que um download cancelado deixou para trás (.part, .ytdl, fragmentos)."""
-    import glob
-    for arquivo in arquivos:
-        for sobra in glob.glob(glob.escape(arquivo) + "*"):
+def arquivos_na_pasta(pasta):
+    try:
+        return {p.name for p in Path(pasta).iterdir()}
+    except OSError:
+        return set()
+
+
+def apagar_parciais(pasta, nome_base, existentes):
+    """Remove o que um download cancelado criou (.part, .ytdl, fragmentos, partes prontas).
+
+    Só apaga arquivos que não estavam na pasta antes do download (`existentes`) e cujo
+    nome começa com o nome deste vídeo; arquivos antigos, mesmo parciais, ficam.
+    """
+    for nome in arquivos_na_pasta(pasta) - existentes:
+        if nome.startswith(nome_base + "."):
             try:
-                os.remove(sobra)
+                os.remove(Path(pasta) / nome)
             except OSError:
                 pass
 
@@ -254,8 +265,8 @@ def baixar(url, fila, qualidade="Melhor qualidade", pasta=None, cancelar=None):
     pasta = Path(pasta) if pasta else pasta_padrao()
     cancelar = cancelar or threading.Event()
     partes = {"atual": 0}
-    # Só arquivos que este download escreveu; um vídeo que já existia antes nunca entra aqui
-    escritos = set()
+    # Preenchido logo antes do download: nome do vídeo e o que já estava na pasta
+    limpeza = {"nome_base": None, "existentes": set()}
 
     def conferir_cancelamento():
         if cancelar.is_set():
@@ -264,7 +275,6 @@ def baixar(url, fila, qualidade="Melhor qualidade", pasta=None, cancelar=None):
     def progresso(d):
         conferir_cancelamento()
         if d["status"] == "downloading":
-            escritos.update(f for f in (d.get("filename"), d.get("tmpfilename")) if f)
             if qualidade == SO_AUDIO or partes["atual"] > 0:
                 parte = "áudio"
             else:
@@ -316,12 +326,19 @@ def baixar(url, fila, qualidade="Melhor qualidade", pasta=None, cancelar=None):
             detalhes["imagem"] = baixar_miniatura(ydl, info)
             fila.put(("info", detalhes, "Começando o download..."))
             conferir_cancelamento()
+            # Foto da pasta antes de baixar, para o cancelamento só apagar o que for novo
+            limpeza["nome_base"] = Path(ydl.prepare_filename(info)).stem
+            limpeza["existentes"] = arquivos_na_pasta(pasta)
             info = ydl.process_ie_result(info, download=True)
+        # O clique em Cancelar pode chegar enquanto o ffmpeg roda, antes de o botão ser
+        # desabilitado; nesse caso o cancelamento vale e o arquivo final também é apagado
+        conferir_cancelamento()
         fila.put(("fim", True, f"Concluído: {info.get('title', 'vídeo')}"))
     except Exception as e:
         # Se o usuário pediu para cancelar, qualquer erro que veio junto é consequência disso
         if cancelar.is_set():
-            apagar_parciais(escritos)
+            if limpeza["nome_base"]:
+                apagar_parciais(pasta, limpeza["nome_base"], limpeza["existentes"])
             fila.put(("fim", False, "Download cancelado."))
             return
         registrar_erro(url, e)
