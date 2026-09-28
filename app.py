@@ -180,31 +180,108 @@ def registrar_erro(url, erro):
         pass
 
 
-def baixar(url, fila, qualidade="Melhor qualidade", pasta=None):
+def formatar_bytes(n):
+    for unidade in ("B", "KB", "MB"):
+        if n < 1024:
+            return f"{n:.0f} {unidade}" if unidade != "MB" else f"{n:.1f} {unidade}"
+        n /= 1024
+    return f"{n:.2f} GB"
+
+
+def formatar_tempo(segundos):
+    minutos, segundos = divmod(int(segundos), 60)
+    horas, minutos = divmod(minutos, 60)
+    return f"{horas}:{minutos:02d}:{segundos:02d}" if horas else f"{minutos}:{segundos:02d}"
+
+
+def texto_progresso(parte, d):
+    """Ex.: 'Baixando vídeo... 45% · 36.1 MB de 79.9 MB · 5.2 MB/s · faltam 0:08'."""
+    baixado = d.get("downloaded_bytes") or 0
+    total = d.get("total_bytes") or d.get("total_bytes_estimate")
+    trechos = [f"Baixando {parte}..."]
+    if total:
+        trechos[0] += f" {baixado / total * 100:.0f}%"
+        # Sem total_bytes o yt-dlp só tem uma estimativa
+        aprox = "" if d.get("total_bytes") else "~"
+        trechos.append(f"{formatar_bytes(baixado)} de {aprox}{formatar_bytes(total)}")
+    else:
+        trechos.append(formatar_bytes(baixado))
+    if d.get("speed"):
+        trechos.append(f"{formatar_bytes(d['speed'])}/s")
+    if d.get("eta") is not None:
+        trechos.append(f"faltam {formatar_tempo(d['eta'])}")
+    return " · ".join(trechos)
+
+
+def baixar_miniatura(ydl, info):
+    """Baixa a miniatura já reduzida para a janela. Devolve uma imagem do Pillow ou None."""
+    try:
+        from io import BytesIO
+        from PIL import Image
+
+        candidatas = [t for t in info.get("thumbnails") or []
+                      if t.get("url") and (t.get("width") or 0) >= 160]
+        # A menor que ainda fica nítida em 160 px de largura, para baixar rápido
+        url = min(candidatas, key=lambda t: t["width"])["url"] if candidatas else info.get("thumbnail")
+        if not url:
+            return None
+        imagem = Image.open(BytesIO(ydl.urlopen(url).read())).convert("RGB")
+        imagem.thumbnail((160, 90))
+        return imagem
+    except Exception:
+        # Miniatura é só enfeite: sem ela o download segue normalmente
+        return None
+
+
+def apagar_parciais(arquivos):
+    """Remove o que um download cancelado deixou para trás (.part, .ytdl, fragmentos)."""
+    import glob
+    for arquivo in arquivos:
+        for sobra in glob.glob(glob.escape(arquivo) + "*"):
+            try:
+                os.remove(sobra)
+            except OSError:
+                pass
+
+
+def baixar(url, fila, qualidade="Melhor qualidade", pasta=None, cancelar=None):
     """Baixa o vídeo de forma bloqueante, mandando atualizações para a interface pela fila.
 
     O chamador deve rodar esta função em uma thread separada. Sempre termina com
-    uma mensagem "fim" na fila, mesmo em caso de erro.
+    uma mensagem "fim" na fila, mesmo em caso de erro ou cancelamento. Para cancelar,
+    o chamador liga o threading.Event `cancelar`.
     """
     pasta = Path(pasta) if pasta else pasta_padrao()
+    cancelar = cancelar or threading.Event()
     partes = {"atual": 0}
+    # Só arquivos que este download escreveu; um vídeo que já existia antes nunca entra aqui
+    escritos = set()
+
+    def conferir_cancelamento():
+        if cancelar.is_set():
+            raise yt_dlp.utils.DownloadCancelled()
 
     def progresso(d):
+        conferir_cancelamento()
         if d["status"] == "downloading":
+            escritos.update(f for f in (d.get("filename"), d.get("tmpfilename")) if f)
+            if qualidade == SO_AUDIO or partes["atual"] > 0:
+                parte = "áudio"
+            else:
+                parte = "vídeo"
             total = d.get("total_bytes") or d.get("total_bytes_estimate")
-            if total:
-                pct = d["downloaded_bytes"] / total * 100
-                if qualidade == SO_AUDIO or partes["atual"] > 0:
-                    parte = "áudio"
-                else:
-                    parte = "vídeo"
-                fila.put(("progresso", pct, f"Baixando {parte}... {pct:.0f}%"))
+            pct = d["downloaded_bytes"] / total * 100 if total else 0
+            fila.put(("progresso", pct, texto_progresso(parte, d)))
         elif d["status"] == "finished":
             partes["atual"] += 1
 
     def pos_processamento(d):
         if d["status"] != "started":
             return
+        conferir_cancelamento()
+        if d["postprocessor"] in ("Merger", "ExtractAudio"):
+            # O ffmpeg não pode ser interrompido no meio sem deixar arquivo quebrado
+            fila.put(("sem_cancelar", None, None))
         if d["postprocessor"] == "Merger":
             fila.put(("progresso", 100, "Juntando vídeo e áudio..."))
         elif d["postprocessor"] == "ExtractAudio":
@@ -226,9 +303,27 @@ def baixar(url, fila, qualidade="Melhor qualidade", pasta=None):
             "postprocessor_hooks": [pos_processamento],
         }
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            info = ydl.extract_info(url, download=True)
+            # Duas etapas para mostrar título e miniatura antes de o download começar
+            info = ydl.extract_info(url, download=False)
+            conferir_cancelamento()
+            detalhes = {
+                "titulo": info.get("title") or "Sem título",
+                "canal": info.get("uploader") or info.get("channel") or "",
+                "duracao": formatar_tempo(info["duration"]) if info.get("duration") else "",
+                "imagem": None,
+            }
+            fila.put(("info", detalhes, "Baixando miniatura..."))
+            detalhes["imagem"] = baixar_miniatura(ydl, info)
+            fila.put(("info", detalhes, "Começando o download..."))
+            conferir_cancelamento()
+            info = ydl.process_ie_result(info, download=True)
         fila.put(("fim", True, f"Concluído: {info.get('title', 'vídeo')}"))
     except Exception as e:
+        # Se o usuário pediu para cancelar, qualquer erro que veio junto é consequência disso
+        if cancelar.is_set():
+            apagar_parciais(escritos)
+            fila.put(("fim", False, "Download cancelado."))
+            return
         registrar_erro(url, e)
         fila.put(("fim", False, mensagem_erro(e)))
 
@@ -241,6 +336,7 @@ class App(tk.Tk):
         self.resizable(False, False)
         self.fila = queue.Queue()
         self.baixando = False
+        self.evento_cancelar = threading.Event()
         self.pasta = carregar_pasta()
 
         quadro = ttk.Frame(self, padding=16)
@@ -259,7 +355,9 @@ class App(tk.Tk):
         self.qualidade.pack(side="left")
         self.botao = ttk.Button(botoes, text="Baixar", command=self.iniciar)
         self.botao.pack(side="left", padx=8)
-        ttk.Button(botoes, text="Abrir pasta", command=self.abrir_pasta).pack(side="left")
+        self.botao_cancelar = ttk.Button(botoes, text="Cancelar", command=self.cancelar, state="disabled")
+        self.botao_cancelar.pack(side="left")
+        ttk.Button(botoes, text="Abrir pasta", command=self.abrir_pasta).pack(side="left", padx=8)
 
         destino = ttk.Frame(quadro)
         destino.pack(fill="x", pady=(8, 0))
@@ -268,6 +366,18 @@ class App(tk.Tk):
         self.rotulo_pasta = ttk.Label(destino, foreground="gray")
         self.rotulo_pasta.pack(side="left", padx=8)
         self.mostrar_pasta()
+
+        # Miniatura e dados do vídeo; só aparece depois que o link é lido
+        self.quadro_info = ttk.Frame(quadro)
+        self.miniatura = ttk.Label(self.quadro_info)
+        self.miniatura.pack(side="left", padx=(0, 10))
+        textos = ttk.Frame(self.quadro_info)
+        textos.pack(side="left", fill="x", expand=True)
+        self.rotulo_titulo = ttk.Label(textos, font=("Segoe UI", 10, "bold"), wraplength=310)
+        self.rotulo_titulo.pack(anchor="w")
+        self.rotulo_detalhes = ttk.Label(textos, foreground="gray")
+        self.rotulo_detalhes.pack(anchor="w", pady=(2, 0))
+        self._imagem_tk = None  # referência precisa ficar viva, senão o Tk apaga a imagem
 
         self.barra = ttk.Progressbar(quadro, maximum=100)
         self.barra.pack(fill="x", pady=(12, 4))
@@ -310,22 +420,51 @@ class App(tk.Tk):
         self.url.config(state="disabled")
         self.qualidade.config(state="disabled")
         self.botao_pasta.config(state="disabled")
+        self.botao_cancelar.config(state="normal")
         self.barra["value"] = 0
-        args = (url, self.fila, self.qualidade.get(), self.pasta)
+        self.quadro_info.pack_forget()
+        self.evento_cancelar = threading.Event()
+        args = (url, self.fila, self.qualidade.get(), self.pasta, self.evento_cancelar)
         threading.Thread(target=baixar, args=args, daemon=True).start()
         self.after(100, self.atualizar)
+
+    def cancelar(self):
+        self.evento_cancelar.set()
+        self.botao_cancelar.config(state="disabled")
+        self.status.config(text="Cancelando...")
+
+    def mostrar_info(self, detalhes):
+        self.rotulo_titulo.config(text=detalhes["titulo"])
+        self.rotulo_detalhes.config(text=" · ".join(t for t in (detalhes["canal"], detalhes["duracao"]) if t))
+        if detalhes["imagem"] is not None:
+            from PIL import ImageTk
+            self._imagem_tk = ImageTk.PhotoImage(detalhes["imagem"])
+            self.miniatura.config(image=self._imagem_tk)
+        else:
+            self._imagem_tk = None
+            self.miniatura.config(image="")
+        # Fica logo acima da barra de progresso
+        self.quadro_info.pack(fill="x", pady=(12, 0), before=self.barra)
 
     def atualizar(self):
         # Só a thread principal pode mexer na interface do Tkinter
         try:
             while True:
                 tipo, valor, texto = self.fila.get_nowait()
-                self.status.config(text=texto)
-                if tipo == "progresso":
+                if tipo == "sem_cancelar":
+                    self.botao_cancelar.config(state="disabled")
+                    continue
+                if tipo == "info":
+                    self.mostrar_info(valor)
+                elif tipo == "progresso":
                     self.barra["value"] = valor
-                else:
+                # Depois de pedir o cancelamento, não deixa o progresso apagar o "Cancelando..."
+                if not (self.evento_cancelar.is_set() and tipo != "fim"):
+                    self.status.config(text=texto)
+                if tipo == "fim":
                     self.barra["value"] = 100 if valor else 0
                     self.botao.config(state="normal")
+                    self.botao_cancelar.config(state="disabled")
                     self.url.config(state="normal")
                     self.qualidade.config(state="readonly")
                     self.botao_pasta.config(state="normal")
