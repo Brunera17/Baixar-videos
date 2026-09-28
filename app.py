@@ -19,7 +19,11 @@ if sys.stderr is None:
 
 
 def baixar(url, fila):
-    """Roda em uma thread separada e manda atualizações para a interface pela fila."""
+    """Baixa o vídeo de forma bloqueante, mandando atualizações para a interface pela fila.
+
+    O chamador deve rodar esta função em uma thread separada. Sempre termina com
+    uma mensagem "fim" na fila, mesmo em caso de erro.
+    """
     partes = {"atual": 0}
 
     def progresso(d):
@@ -36,24 +40,23 @@ def baixar(url, fila):
         if d["status"] == "started" and d["postprocessor"] == "Merger":
             fila.put(("progresso", 100, "Juntando vídeo e áudio..."))
 
-    ydl_opts = {
-        # O YouTube entrega vídeo e áudio separados; o ffmpeg junta os dois em um .mp4
-        "format": "bestvideo[ext=mp4]+bestaudio[ext=m4a]/bestvideo+bestaudio/best",
-        "merge_output_format": "mp4",
-        "ffmpeg_location": imageio_ffmpeg.get_ffmpeg_exe(),
-        # Usa o Node.js instalado para resolver o JavaScript do YouTube
-        "js_runtimes": {"node": {}},
-        "outtmpl": str(PASTA_DOWNLOADS / "%(title)s.%(ext)s"),
-        "noplaylist": True,
-        "quiet": True,
-        "no_warnings": True,
-        "noprogress": True,
-        "progress_hooks": [progresso],
-        "postprocessor_hooks": [pos_processamento],
-    }
-
     try:
         fila.put(("progresso", 0, "Buscando informações do vídeo..."))
+        ydl_opts = {
+            # O YouTube entrega vídeo e áudio separados; o ffmpeg junta os dois em um .mp4
+            "format": "bestvideo[ext=mp4]+bestaudio[ext=m4a]/bestvideo+bestaudio/best",
+            "merge_output_format": "mp4",
+            "ffmpeg_location": imageio_ffmpeg.get_ffmpeg_exe(),
+            # Usa o Node.js instalado para resolver o JavaScript do YouTube
+            "js_runtimes": {"node": {}},
+            "outtmpl": str(PASTA_DOWNLOADS / "%(title)s.%(ext)s"),
+            "noplaylist": True,
+            "quiet": True,
+            "no_warnings": True,
+            "noprogress": True,
+            "progress_hooks": [progresso],
+            "postprocessor_hooks": [pos_processamento],
+        }
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
             info = ydl.extract_info(url, download=True)
         fila.put(("fim", True, f"Concluído: {info.get('title', 'vídeo')}"))
@@ -68,6 +71,7 @@ class App(tk.Tk):
         self.geometry("520x200")
         self.resizable(False, False)
         self.fila = queue.Queue()
+        self.baixando = False
 
         quadro = ttk.Frame(self, padding=16)
         quadro.pack(fill="both", expand=True)
@@ -82,19 +86,31 @@ class App(tk.Tk):
         botoes.pack(fill="x")
         self.botao = ttk.Button(botoes, text="Baixar", command=self.iniciar)
         self.botao.pack(side="left")
-        ttk.Button(botoes, text="Abrir pasta", command=lambda: os.startfile(PASTA_DOWNLOADS)).pack(side="left", padx=8)
+        ttk.Button(botoes, text="Abrir pasta", command=self.abrir_pasta).pack(side="left", padx=8)
 
         self.barra = ttk.Progressbar(quadro, maximum=100)
         self.barra.pack(fill="x", pady=(12, 4))
         self.status = ttk.Label(quadro, text=f"Os vídeos são salvos em {PASTA_DOWNLOADS}")
         self.status.pack(anchor="w")
 
+    def abrir_pasta(self):
+        try:
+            PASTA_DOWNLOADS.mkdir(parents=True, exist_ok=True)
+            os.startfile(PASTA_DOWNLOADS)
+        except OSError as e:
+            self.status.config(text=f"Não foi possível abrir a pasta: {e}")
+
     def iniciar(self):
+        # O Enter no campo também chama iniciar, então o bloqueio não pode depender só do botão
+        if self.baixando:
+            return
         url = self.url.get().strip()
         if not url:
             self.status.config(text="Cole um link primeiro.")
             return
+        self.baixando = True
         self.botao.config(state="disabled")
+        self.url.config(state="disabled")
         self.barra["value"] = 0
         threading.Thread(target=baixar, args=(url, self.fila), daemon=True).start()
         self.after(100, self.atualizar)
@@ -110,6 +126,8 @@ class App(tk.Tk):
                 else:
                     self.barra["value"] = 100 if valor else 0
                     self.botao.config(state="normal")
+                    self.url.config(state="normal")
+                    self.baixando = False
                     return
         except queue.Empty:
             pass
