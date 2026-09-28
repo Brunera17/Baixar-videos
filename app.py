@@ -12,6 +12,8 @@ import yt_dlp
 
 # Onde o app guarda as preferências (hoje, só a última pasta escolhida)
 ARQUIVO_CONFIG = Path(os.environ.get("APPDATA", Path.home())) / "BaixarVideos" / "config.json"
+# Erros técnicos completos, para diagnóstico
+ARQUIVO_LOG = ARQUIVO_CONFIG.with_name("erros.log")
 
 SO_AUDIO = "Só áudio (MP3)"
 # Opção do menu -> altura máxima do vídeo (None = sem limite)
@@ -118,6 +120,64 @@ def opcoes_formato(qualidade):
     }
 
 
+# (trechos da mensagem do yt-dlp/YouTube em minúsculas, mensagem para o usuário).
+# A ordem importa: a primeira regra que bater vence.
+ERROS_CONHECIDOS = [
+    (("is not a valid url",), "Link inválido. Confira se copiou o endereço completo do vídeo."),
+    (("unsupported url",), "Esse link não é de um vídeo suportado."),
+    (("private video",), "Esse vídeo é privado."),
+    (("confirm your age", "age-restricted", "inappropriate for some users"),
+     "Esse vídeo tem restrição de idade e exige login no YouTube."),
+    (("not a bot",), "O YouTube pediu uma verificação anti-robô. Tente de novo mais tarde."),
+    (("members-only", "channel's members", "join this channel"),
+     "Esse vídeo é exclusivo para membros do canal."),
+    (("not available in your country", "not made this video available in your country"),
+     "Esse vídeo está bloqueado no seu país."),
+    (("premieres in", "live event will begin", "is upcoming"), "Esse vídeo ainda não foi publicado (estreia agendada)."),
+    (("http error 429", "too many requests"),
+     "O YouTube bloqueou temporariamente por excesso de pedidos. Tente de novo mais tarde."),
+    (("video unavailable", "video is unavailable", "has been removed", "no longer available"),
+     "Vídeo indisponível: foi removido ou o link está errado."),
+    (("requested format is not available",), "A qualidade escolhida não está disponível para esse vídeo."),
+]
+
+
+def mensagem_erro(erro):
+    """Traduz um erro do download em uma mensagem simples para o usuário."""
+    # O yt-dlp embrulha o erro original em DownloadError; o original diz mais sobre a causa
+    original = getattr(erro, "exc_info", None) and erro.exc_info[1] or erro
+    texto = str(erro).lower()
+
+    if isinstance(original, yt_dlp.utils.GeoRestrictedError):
+        return "Esse vídeo está bloqueado no seu país."
+    for trechos, mensagem in ERROS_CONHECIDOS:
+        if any(t in texto for t in trechos):
+            return mensagem
+    if isinstance(original, yt_dlp.networking.exceptions.TransportError):
+        return "Não foi possível conectar. Verifique sua internet e se o link está certo."
+    if isinstance(original, yt_dlp.utils.PostProcessingError) or isinstance(erro, yt_dlp.utils.PostProcessingError):
+        return "O download terminou, mas falhou ao juntar/converter o arquivo."
+    for e in (original, erro):
+        if isinstance(e, PermissionError):
+            return "Sem permissão para salvar na pasta escolhida. Escolha outra em \"Salvar em...\"."
+        if isinstance(e, OSError) and e.errno == 28:  # ENOSPC
+            return "Sem espaço no disco."
+    return f"Não foi possível baixar esse vídeo. Detalhes técnicos em {ARQUIVO_LOG}"
+
+
+def registrar_erro(url, erro):
+    """Guarda o erro técnico completo para diagnóstico, já que a janela só mostra o resumo."""
+    import traceback
+    from datetime import datetime
+    try:
+        ARQUIVO_LOG.parent.mkdir(parents=True, exist_ok=True)
+        with ARQUIVO_LOG.open("a", encoding="utf-8") as log:
+            log.write(f"\n[{datetime.now():%Y-%m-%d %H:%M:%S}] {url}\n")
+            log.write("".join(traceback.format_exception(erro)))
+    except OSError:
+        pass
+
+
 def baixar(url, fila, qualidade="Melhor qualidade", pasta=None):
     """Baixa o vídeo de forma bloqueante, mandando atualizações para a interface pela fila.
 
@@ -167,7 +227,8 @@ def baixar(url, fila, qualidade="Melhor qualidade", pasta=None):
             info = ydl.extract_info(url, download=True)
         fila.put(("fim", True, f"Concluído: {info.get('title', 'vídeo')}"))
     except Exception as e:
-        fila.put(("fim", False, f"Erro: {e}"))
+        registrar_erro(url, e)
+        fila.put(("fim", False, mensagem_erro(e)))
 
 
 class App(tk.Tk):
@@ -208,7 +269,7 @@ class App(tk.Tk):
 
         self.barra = ttk.Progressbar(quadro, maximum=100)
         self.barra.pack(fill="x", pady=(12, 4))
-        self.status = ttk.Label(quadro, text="Pronto.")
+        self.status = ttk.Label(quadro, text="Pronto.", wraplength=488)
         self.status.pack(anchor="w")
 
     def mostrar_pasta(self):
