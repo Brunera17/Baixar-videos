@@ -3,3 +3,4 @@ yt-dlp-ejs
 imageio-ffmpeg
 deno
 pillow
+ttkbootstrap>=2.2,<3

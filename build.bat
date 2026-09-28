@@ -16,6 +16,8 @@ if not exist "%DENO%" (
 )
 
 python -m PyInstaller --noconfirm --onefile --windowed --name BaixarVideos ^
+    --icon assets\icone.ico ^
+    --add-data "assets;assets" ^
     --copy-metadata yt-dlp ^
     --collect-binaries imageio_ffmpeg ^
     --collect-data yt_dlp_ejs ^

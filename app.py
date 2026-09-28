@@ -12,9 +12,10 @@ import tkinter as tk
 import urllib.request
 import zipfile
 from pathlib import Path
-from tkinter import filedialog, ttk
+from tkinter import filedialog
 
 import imageio_ffmpeg
+import ttkbootstrap as tb
 
 # Onde o app guarda as preferências (hoje, só a última pasta escolhida)
 ARQUIVO_CONFIG = Path(os.environ.get("APPDATA", Path.home())) / "BaixarVideos" / "config.json"
@@ -90,6 +91,40 @@ if sys.stdout is None:
     sys.stdout = open(os.devnull, "w")
 if sys.stderr is None:
     sys.stderr = open(os.devnull, "w")
+
+
+def caminho_recurso(*partes):
+    """Arquivo que vai junto com o app (ícone etc.), dentro ou fora do .exe."""
+    base = Path(sys._MEIPASS) if getattr(sys, "frozen", False) else Path(__file__).resolve().parent
+    return str(base.joinpath(*partes))
+
+
+def tema_do_windows():
+    """Tema escuro se o Windows estiver no modo escuro para apps; senão, claro."""
+    try:
+        import winreg
+        with winreg.OpenKey(winreg.HKEY_CURRENT_USER,
+                            r"Software\Microsoft\Windows\CurrentVersion\Themes\Personalize") as chave:
+            claro = winreg.QueryValueEx(chave, "AppsUseLightTheme")[0]
+        return "bootstrap-light" if claro else "bootstrap-dark"
+    except (ImportError, OSError):
+        return "bootstrap-light"
+
+
+def barra_de_titulo_escura(janela):
+    """Pede ao Windows 10/11 a barra de título escura (senão ela fica branca no tema escuro)."""
+    try:
+        import ctypes
+        janela.update_idletasks()
+        hwnd = ctypes.windll.user32.GetParent(janela.winfo_id())
+        ligado = ctypes.c_int(1)
+        # 20 = DWMWA_USE_IMMERSIVE_DARK_MODE (19 em versões antigas do Windows 10)
+        for atributo in (20, 19):
+            if ctypes.windll.dwmapi.DwmSetWindowAttribute(
+                    hwnd, atributo, ctypes.byref(ligado), ctypes.sizeof(ligado)) == 0:
+                break
+    except (AttributeError, OSError):
+        pass
 
 
 def caminho_deno():
@@ -504,12 +539,18 @@ def baixar(url, fila, qualidade="Melhor qualidade", pasta=None, cancelar=None):
         fila.put(("fim", "Erro", mensagem_erro(e)))
 
 
-class App(tk.Tk):
+class App(tb.App):
     def __init__(self):
-        super().__init__()
-        self.title("Baixar Vídeos")
-        self.minsize(520, 0)
-        self.resizable(False, False)
+        super().__init__(
+            title="Baixar Vídeos", theme=tema_do_windows(), iconphoto=None,
+            minsize=(540, 0), resizable=(False, False))
+        # .ico tem vários tamanhos; o Windows escolhe o certo para a barra de título e a de tarefas
+        try:
+            self.iconbitmap(default=caminho_recurso("assets", "icone.ico"))
+        except tk.TclError:
+            pass
+        if "dark" in self.style.theme_use():
+            barra_de_titulo_escura(self)
         self.fila = queue.Queue()
         self.itens = {}  # id da linha na lista -> url, qualidade, pasta e mensagem final
         self.pendentes = []  # ids na ordem em que vão ser baixados
@@ -518,79 +559,93 @@ class App(tk.Tk):
         self.evento_cancelar = threading.Event()
         self.pasta = carregar_pasta()
 
-        quadro = ttk.Frame(self, padding=16)
+        quadro = tb.Frame(self, padding=20)
         quadro.pack(fill="both", expand=True)
 
-        ttk.Label(quadro, text="Cole um ou mais links (um por linha):").pack(anchor="w")
-        self.links = tk.Text(quadro, height=3, wrap="none", font=("Segoe UI", 9), undo=True)
-        self.links.pack(fill="x", pady=(4, 8))
+        tb.Label(quadro, text="Baixar Vídeos", font=("Segoe UI Semibold", 15)).pack(anchor="w")
+        tb.Label(quadro, text="Cole um ou mais links (um por linha) e clique em Baixar.",
+                 bootstyle="secondary").pack(anchor="w", pady=(0, 10))
+        self.links = tb.Text(quadro, height=3, wrap="none", font=("Segoe UI", 10), undo=True)
+        self.links.pack(fill="x", pady=(0, 10))
         self.links.focus()
         # Enter sozinho pula linha (para colar vários links); Ctrl+Enter adiciona à fila
         self.links.bind("<Control-Return>", lambda _: (self.adicionar(), "break")[1])
 
-        botoes = ttk.Frame(quadro)
+        botoes = tb.Frame(quadro)
         botoes.pack(fill="x")
-        self.qualidade = ttk.Combobox(botoes, values=list(QUALIDADES), state="readonly", width=18)
+        self.qualidade = tb.Combobox(botoes, values=list(QUALIDADES), state="readonly", width=17)
         self.qualidade.current(0)
         self.qualidade.pack(side="left")
-        self.botao = ttk.Button(botoes, text="Baixar", command=self.adicionar)
+        self.botao = tb.Button(botoes, text="Baixar", command=self.adicionar, bootstyle="primary", width=9)
         self.botao.pack(side="left", padx=8)
-        self.botao_cancelar = ttk.Button(botoes, text="Cancelar", command=self.cancelar, state="disabled")
+        self.botao_cancelar = tb.Button(botoes, text="Cancelar", command=self.cancelar, state="disabled",
+                                        bootstyle="danger-outline")
         self.botao_cancelar.pack(side="left")
-        ttk.Button(botoes, text="Abrir pasta", command=self.abrir_pasta).pack(side="left", padx=8)
+        tb.Button(botoes, text="Abrir pasta", command=self.abrir_pasta,
+                  bootstyle="secondary-outline").pack(side="right")
 
-        destino = ttk.Frame(quadro)
-        destino.pack(fill="x", pady=(8, 0))
-        self.botao_pasta = ttk.Button(destino, text="Salvar em...", command=self.escolher_pasta)
+        destino = tb.Frame(quadro)
+        destino.pack(fill="x", pady=(10, 0))
+        self.botao_pasta = tb.Button(destino, text="Salvar em...", command=self.escolher_pasta,
+                                     bootstyle="secondary-outline")
         self.botao_pasta.pack(side="left")
-        self.rotulo_pasta = ttk.Label(destino, foreground="gray")
-        self.rotulo_pasta.pack(side="left", padx=8)
+        self.rotulo_pasta = tb.Label(destino, bootstyle="secondary")
+        self.rotulo_pasta.pack(side="left", padx=10)
         self.mostrar_pasta()
 
         # Fila de downloads
-        area_lista = ttk.Frame(quadro)
-        area_lista.pack(fill="x", pady=(12, 0))
-        self.lista = ttk.Treeview(
+        area_lista = tb.Frame(quadro)
+        area_lista.pack(fill="x", pady=(16, 0))
+        self.lista = tb.Treeview(
             area_lista, columns=("video", "qualidade", "estado"), show="headings", height=5)
-        for coluna, titulo, largura in (("video", "Vídeo", 250), ("qualidade", "Qualidade", 95),
-                                        ("estado", "Situação", 105)):
+        for coluna, titulo, largura in (("video", "Vídeo", 250), ("qualidade", "Qualidade", 117),
+                                        ("estado", "Situação", 100)):
             self.lista.heading(coluna, text=titulo, anchor="w")
             self.lista.column(coluna, width=largura, minwidth=largura, stretch=coluna == "video")
-        rolagem = ttk.Scrollbar(area_lista, orient="vertical", command=self.lista.yview)
+        rolagem = tb.Scrollbar(area_lista, orient="vertical", command=self.lista.yview)
         self.lista.configure(yscrollcommand=rolagem.set)
         self.lista.pack(side="left", fill="x", expand=True)
         rolagem.pack(side="left", fill="y")
         self.lista.bind("<<TreeviewSelect>>", self.mostrar_mensagem_item)
+        cores = self.style.colors
+        self.lista.tag_configure("Concluído", foreground=cores.success)
+        self.lista.tag_configure("Erro", foreground=cores.danger)
+        self.lista.tag_configure("Cancelado", foreground=cores.secondary)
 
-        botoes_lista = ttk.Frame(quadro)
-        botoes_lista.pack(fill="x", pady=(4, 0))
-        ttk.Button(botoes_lista, text="Remover selecionados", command=self.remover_selecionados).pack(side="left")
-        ttk.Button(botoes_lista, text="Limpar concluídos", command=self.limpar_concluidos).pack(side="left", padx=8)
+        botoes_lista = tb.Frame(quadro)
+        botoes_lista.pack(fill="x", pady=(6, 0))
+        tb.Button(botoes_lista, text="Remover selecionados", command=self.remover_selecionados,
+                  bootstyle="link").pack(side="left")
+        tb.Button(botoes_lista, text="Limpar concluídos", command=self.limpar_concluidos,
+                  bootstyle="link").pack(side="left")
 
         # Miniatura e dados do vídeo atual; só aparece depois que o link é lido
-        self.quadro_info = ttk.Frame(quadro)
-        self.miniatura = ttk.Label(self.quadro_info)
-        self.miniatura.pack(side="left", padx=(0, 10))
-        textos = ttk.Frame(self.quadro_info)
+        self.quadro_info = tb.Frame(quadro)
+        self.miniatura = tb.Label(self.quadro_info)
+        self.miniatura.pack(side="left", padx=(0, 12))
+        textos = tb.Frame(self.quadro_info)
         textos.pack(side="left", fill="x", expand=True)
-        self.rotulo_titulo = ttk.Label(textos, font=("Segoe UI", 10, "bold"), wraplength=310)
+        self.rotulo_titulo = tb.Label(textos, font=("Segoe UI Semibold", 11), wraplength=320)
         self.rotulo_titulo.pack(anchor="w")
-        self.rotulo_detalhes = ttk.Label(textos, foreground="gray")
+        self.rotulo_detalhes = tb.Label(textos, bootstyle="secondary")
         self.rotulo_detalhes.pack(anchor="w", pady=(2, 0))
         self._imagem_tk = None  # referência precisa ficar viva, senão o Tk apaga a imagem
 
-        self.barra = ttk.Progressbar(quadro, maximum=100)
-        self.barra.pack(fill="x", pady=(12, 4))
-        self.status = ttk.Label(quadro, text="Pronto.", wraplength=488)
+        self.barra = tb.Progressbar(quadro, maximum=100, bootstyle="success")
+        self.barra.pack(fill="x", pady=(16, 6))
+        self.status = tb.Label(quadro, text="Pronto.", wraplength=500)
         self.status.pack(anchor="w")
 
         # Rodapé: versão do yt-dlp em uso e aviso quando há uma mais nova
-        rodape = ttk.Frame(quadro)
-        rodape.pack(fill="x", pady=(10, 0))
-        ttk.Label(rodape, text=f"yt-dlp {yt_dlp.version.__version__}", foreground="gray").pack(side="left")
-        self.aviso = ttk.Label(rodape, text=AVISO_YT_DLP or "", foreground="#b35c00", wraplength=300)
+        tb.Separator(quadro).pack(fill="x", pady=(14, 8))
+        rodape = tb.Frame(quadro)
+        rodape.pack(fill="x")
+        tb.Label(rodape, text=f"yt-dlp {yt_dlp.version.__version__}", bootstyle="secondary",
+                 font=("Segoe UI", 8)).pack(side="left")
+        self.aviso = tb.Label(rodape, text=AVISO_YT_DLP or "", wraplength=300)
         self.aviso.pack(side="left", padx=8)
-        self.botao_atualizar = ttk.Button(rodape, text="Atualizar", command=self.instalar_atualizacao)
+        self.botao_atualizar = tb.Button(rodape, text="Atualizar", command=self.instalar_atualizacao,
+                                         bootstyle="warning")
         self.versao_nova = None
         self.fila_atualizacao = queue.Queue()
         self.em_segundo_plano(versao_nova_disponivel)
@@ -667,6 +722,8 @@ class App(tk.Tk):
 
     def definir_estado(self, iid, estado):
         self.lista.set(iid, "estado", estado)
+        # Cor da linha pela situação final (as tags são configuradas em __init__)
+        self.lista.item(iid, tags=(estado,) if estado in ("Concluído", "Erro", "Cancelado") else ())
 
     def adicionar(self):
         """Coloca na fila os links da caixa de texto; começa a baixar se estiver parado."""
@@ -790,4 +847,11 @@ class App(tk.Tk):
 
 
 if __name__ == "__main__":
+    # Faz o Windows agrupar a janela com o ícone do app na barra de tarefas
+    # (rodando pelo Python, senão apareceria o ícone do python.exe)
+    try:
+        import ctypes
+        ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID("BaixarVideos.App")
+    except (AttributeError, OSError):
+        pass
     App().mainloop()
