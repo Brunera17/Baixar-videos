@@ -173,8 +173,10 @@ def registrar_erro(url, erro):
         ARQUIVO_LOG.parent.mkdir(parents=True, exist_ok=True)
         with ARQUIVO_LOG.open("a", encoding="utf-8") as log:
             log.write(f"\n[{datetime.now():%Y-%m-%d %H:%M:%S}] {url}\n")
-            log.write("".join(traceback.format_exception(erro)))
-    except OSError:
+            # Forma com 3 argumentos: a de 1 argumento só existe a partir do Python 3.11
+            log.write("".join(traceback.format_exception(type(erro), erro, erro.__traceback__)))
+    except Exception:
+        # O log é só diagnóstico: nenhuma falha aqui pode impedir a janela de receber o "fim"
         pass
 
 
