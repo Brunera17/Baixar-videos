@@ -161,25 +161,38 @@ def pasta_padrao():
     return Path.home() / "Downloads"
 
 
+def carregar_config():
+    """Preferências salvas; {} se não houver arquivo ou ele estiver corrompido."""
+    try:
+        dados = json.loads(ARQUIVO_CONFIG.read_text(encoding="utf-8"))
+        return dados if isinstance(dados, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+
+def salvar_config(**valores):
+    """Atualiza só as chaves passadas, mantendo as outras preferências.
+
+    Se não der para gravar, o app só não lembra da preferência.
+    """
+    try:
+        ARQUIVO_CONFIG.parent.mkdir(parents=True, exist_ok=True)
+        ARQUIVO_CONFIG.write_text(json.dumps({**carregar_config(), **valores}), encoding="utf-8")
+    except OSError:
+        pass
+
+
 def carregar_pasta():
     """Última pasta escolhida, ou a padrão se não houver uma salva ou ela não existir mais."""
-    try:
-        valor = json.loads(ARQUIVO_CONFIG.read_text(encoding="utf-8"))["pasta"]
-        # Vazio ou relativo viraria a pasta atual do processo, que sempre existe
-        if isinstance(valor, str) and valor and Path(valor).is_absolute() and Path(valor).is_dir():
-            return Path(valor)
-    except (OSError, ValueError, KeyError, TypeError):
-        pass
+    valor = carregar_config().get("pasta")
+    # Vazio ou relativo viraria a pasta atual do processo, que sempre existe
+    if isinstance(valor, str) and valor and Path(valor).is_absolute() and Path(valor).is_dir():
+        return Path(valor)
     return pasta_padrao()
 
 
 def salvar_pasta(pasta):
-    """Guarda a pasta escolhida; se não der para gravar, o app só não lembra dela."""
-    try:
-        ARQUIVO_CONFIG.parent.mkdir(parents=True, exist_ok=True)
-        ARQUIVO_CONFIG.write_text(json.dumps({"pasta": str(pasta)}), encoding="utf-8")
-    except OSError:
-        pass
+    salvar_config(pasta=str(pasta))
 
 
 def opcoes_formato(qualidade):
@@ -438,6 +451,13 @@ def reiniciar_app():
     subprocess.Popen(comando, env=ambiente, shell=False)
 
 
+def links_do_youtube(texto):
+    """Só os links do YouTube (youtube.com, youtu.be e subdomínios) encontrados no texto."""
+    # O domínio precisa vir logo depois do "https://": "evil.com/youtube.com/..." não passa
+    dominio = re.compile(r"(?:https?://)?(?:[\w-]+\.)*(?:youtube\.com|youtu\.be)/", re.IGNORECASE)
+    return [link for link in extrair_links(texto) if dominio.match(link)]
+
+
 def extrair_links(texto):
     """Links encontrados no texto colado, na ordem, sem repetir.
 
@@ -593,6 +613,17 @@ class App(tb.App):
         self.rotulo_pasta.pack(side="left", padx=10)
         self.mostrar_pasta()
 
+        # Colar sozinho os links do YouTube copiados (ligado por padrão; a escolha fica salva)
+        self.colar_automatico = tk.BooleanVar(value=carregar_config().get("colar_automatico", True) is not False)
+        tb.Checkbutton(quadro, text="Colar automaticamente os links do YouTube que eu copiar",
+                       variable=self.colar_automatico, bootstyle="round-toggle",
+                       command=lambda: salvar_config(colar_automatico=self.colar_automatico.get())
+                       ).pack(anchor="w", pady=(10, 0))
+        self.ultima_area_de_transferencia = None
+        # Ao voltar para o app (ex.: depois de copiar o link no navegador) e ao abrir
+        self.bind("<FocusIn>", self.colar_da_area_de_transferencia, add="+")
+        self.after(300, self.colar_da_area_de_transferencia)
+
         # Fila de downloads
         area_lista = tb.Frame(quadro)
         area_lista.pack(fill="x", pady=(16, 0))
@@ -653,6 +684,36 @@ class App(tb.App):
     @property
     def baixando(self):
         return self.atual is not None
+
+    def colar_da_area_de_transferencia(self, _evento=None):
+        """Coloca na caixa os links do YouTube copiados, se forem novos.
+
+        Só age quando o conteúdo copiado muda: voltar para o app várias vezes com o mesmo
+        link copiado não cola de novo, e um link apagado da caixa não volta sozinho.
+        """
+        if not self.colar_automatico.get():
+            return
+        try:
+            texto = self.clipboard_get()
+        except tk.TclError:  # área de transferência vazia ou com imagem/arquivo
+            return
+        if texto == self.ultima_area_de_transferencia:
+            return
+        self.ultima_area_de_transferencia = texto
+
+        # Não repete o que já está na caixa ou na fila (inclusive os já baixados)
+        conhecidos = set(extrair_links(self.links.get("1.0", "end"))) | {i["url"] for i in self.itens.values()}
+        novos = [link for link in links_do_youtube(texto) if link not in conhecidos]
+        if not novos:
+            return
+        atual = self.links.get("1.0", "end-1c")
+        separador = "\n" if atual.strip() and not atual.endswith("\n") else ""
+        self.links.insert("end", separador + "\n".join(novos) + "\n")
+        self.links.see("end")
+        # Durante um download a linha de status mostra o progresso, que é mais útil
+        if not self.baixando:
+            self.status.config(text=f"{len(novos)} link(s) do YouTube colado(s) automaticamente. "
+                                    "Clique em Baixar.")
 
     def em_segundo_plano(self, tarefa, *args):
         """Roda `tarefa` numa thread; o resultado (ou o erro) chega em ouvir_atualizacao."""
