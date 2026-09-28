@@ -18,6 +18,15 @@ if sys.stderr is None:
     sys.stderr = open(os.devnull, "w")
 
 
+def caminho_deno():
+    """Retorna o deno.exe embutido no executável ou, rodando pelo Python, o do pacote pip."""
+    if getattr(sys, "frozen", False):
+        # O PyInstaller extrai os binários embutidos para esta pasta temporária
+        return os.path.join(sys._MEIPASS, "deno.exe")
+    import deno
+    return deno.find_deno_bin()
+
+
 def baixar(url, fila):
     """Baixa o vídeo de forma bloqueante, mandando atualizações para a interface pela fila.
 
@@ -47,8 +56,8 @@ def baixar(url, fila):
             "format": "bestvideo[ext=mp4]+bestaudio[ext=m4a]/bestvideo+bestaudio/best",
             "merge_output_format": "mp4",
             "ffmpeg_location": imageio_ffmpeg.get_ffmpeg_exe(),
-            # Usa o Node.js instalado para resolver o JavaScript do YouTube
-            "js_runtimes": {"node": {}},
+            # Deno embutido resolve o JavaScript do YouTube, sem exigir nada instalado no PC
+            "js_runtimes": {"deno": {"path": caminho_deno()}},
             "outtmpl": str(PASTA_DOWNLOADS / "%(title)s.%(ext)s"),
             "noplaylist": True,
             "quiet": True,
