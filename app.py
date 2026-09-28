@@ -1,20 +1,78 @@
+import hashlib
+import io
 import json
 import os
 import queue
 import re
+import shutil
+import subprocess
 import sys
 import threading
 import tkinter as tk
+import urllib.request
+import zipfile
 from pathlib import Path
 from tkinter import filedialog, ttk
 
 import imageio_ffmpeg
-import yt_dlp
 
 # Onde o app guarda as preferências (hoje, só a última pasta escolhida)
 ARQUIVO_CONFIG = Path(os.environ.get("APPDATA", Path.home())) / "BaixarVideos" / "config.json"
 # Erros técnicos completos, para diagnóstico
 ARQUIVO_LOG = ARQUIVO_CONFIG.with_name("erros.log")
+# yt-dlp baixado pelo botão Atualizar; tem prioridade sobre o que veio embutido no app
+PASTA_ATUALIZACOES = ARQUIVO_CONFIG.with_name("atualizacoes")
+
+
+def numero_versao(texto):
+    """'2026.08.19' e '2026.8.19' viram (2026, 8, 19), para comparar versões."""
+    return tuple(int(n) for n in re.findall(r"\d+", texto or ""))
+
+
+def versao_embutida():
+    """Versão do yt-dlp que veio com o app, lida sem importar o pacote."""
+    try:
+        from importlib.metadata import version
+        return version("yt-dlp")
+    except Exception:
+        return "0"
+
+
+def ativar_atualizacao():
+    """Põe na frente do sys.path o yt-dlp atualizado, se for mais novo que o embutido.
+
+    Devolve a pasta usada, ou None se o app vai usar a versão embutida.
+    """
+    try:
+        atual = json.loads((PASTA_ATUALIZACOES / "atual.json").read_text(encoding="utf-8"))
+        pasta = PASTA_ATUALIZACOES / atual["pasta"]
+        # Se o app foi reconstruído com um yt-dlp mais novo, a atualização antiga é ignorada
+        if numero_versao(atual["versao"]) > numero_versao(versao_embutida()) and (pasta / "yt_dlp").is_dir():
+            sys.path.insert(0, str(pasta))
+            return pasta
+    except (OSError, ValueError, KeyError, TypeError):
+        pass
+    return None
+
+
+def importar_yt_dlp():
+    """Importa o yt-dlp atualizado, ou o embutido se a atualização não carregar."""
+    pasta = ativar_atualizacao()
+    try:
+        import yt_dlp
+        return yt_dlp, pasta, None
+    except Exception:
+        if pasta is None:
+            raise
+        # Atualização quebrada (ou que precisa de algo que o .exe não tem): volta para a embutida
+        sys.path.remove(str(pasta))
+        for nome in [m for m in sys.modules if m.split(".")[0] in ("yt_dlp", "yt_dlp_ejs")]:
+            del sys.modules[nome]
+        import yt_dlp
+        return yt_dlp, None, "A versão atualizada do yt-dlp não carregou; usando a que veio com o app."
+
+
+yt_dlp, PASTA_EM_USO, AVISO_YT_DLP = importar_yt_dlp()
 
 SO_AUDIO = "Só áudio (MP3)"
 # Opção do menu -> altura máxima do vídeo (None = sem limite)
@@ -256,6 +314,75 @@ def apagar_parciais(pasta, nome_base, existentes):
                 pass
 
 
+def ler_pypi(pacote, versao=None):
+    caminho = f"{pacote}/{versao}/json" if versao else f"{pacote}/json"
+    with urllib.request.urlopen(f"https://pypi.org/pypi/{caminho}", timeout=15) as resposta:
+        return json.load(resposta)
+
+
+def versao_nova_disponivel():
+    """Última versão estável do yt-dlp no PyPI, se for mais nova que a em uso; senão None."""
+    ultima = ler_pypi("yt-dlp")["info"]["version"]  # o PyPI já ignora as versões de teste aqui
+    if numero_versao(ultima) > numero_versao(yt_dlp.version.__version__):
+        return ultima
+    return None
+
+
+def baixar_wheel(dados_pypi):
+    """Baixa o pacote .whl e confere o SHA-256 publicado pelo PyPI antes de aceitar."""
+    wheel = next(u for u in dados_pypi["urls"] if u["packagetype"] == "bdist_wheel")
+    with urllib.request.urlopen(wheel["url"], timeout=60) as resposta:
+        conteudo = resposta.read()
+    if hashlib.sha256(conteudo).hexdigest() != wheel["digests"]["sha256"]:
+        raise ValueError(f"{wheel['filename']} veio corrompido (SHA-256 não confere)")
+    return conteudo
+
+
+def instalar_yt_dlp(versao):
+    """Baixa o yt-dlp `versao` e o yt-dlp-ejs que ele exige para PASTA_ATUALIZACOES.
+
+    A nova versão só passa a valer na próxima vez que o app abrir.
+    """
+    dados = ler_pypi("yt-dlp", versao)
+    pacotes = [dados]
+    # O yt-dlp exige uma versão exata do yt-dlp-ejs (scripts que resolvem o JavaScript do YouTube)
+    for requisito in dados["info"].get("requires_dist") or []:
+        ejs = re.match(r"yt-dlp-ejs==([\w.]+)", requisito)
+        if ejs:
+            pacotes.append(ler_pypi("yt-dlp-ejs", ejs.group(1)))
+            break
+
+    destino = PASTA_ATUALIZACOES / f"yt-dlp-{versao}"
+    temporaria = destino.with_name(destino.name + ".baixando")
+    shutil.rmtree(temporaria, ignore_errors=True)
+    for pacote in pacotes:
+        # .whl é um zip; os pacotes são Python puro, então basta extrair
+        with zipfile.ZipFile(io.BytesIO(baixar_wheel(pacote))) as whl:
+            whl.extractall(temporaria)
+    shutil.rmtree(destino, ignore_errors=True)
+    temporaria.rename(destino)
+    (PASTA_ATUALIZACOES / "atual.json").write_text(
+        json.dumps({"versao": versao, "pasta": destino.name}), encoding="utf-8")
+
+    # Versões antigas: apaga todas, menos a nova e a que este processo está usando
+    for pasta in PASTA_ATUALIZACOES.iterdir():
+        if pasta.is_dir() and pasta not in (destino, PASTA_EM_USO):
+            shutil.rmtree(pasta, ignore_errors=True)
+
+
+def reiniciar_app():
+    """Abre uma nova cópia do app (que vai carregar o yt-dlp atualizado)."""
+    if getattr(sys, "frozen", False):
+        comando = [sys.executable]
+        # Sem isso, a nova cópia do .exe tentaria reaproveitar a pasta temporária desta,
+        # que é apagada quando esta fecha
+        ambiente = {**os.environ, "PYINSTALLER_RESET_ENVIRONMENT": "1"}
+    else:
+        comando = [sys.executable, os.path.abspath(sys.argv[0])]
+        ambiente = None
+    subprocess.Popen(comando, env=ambiente)
+
+
 def extrair_links(texto):
     """Links encontrados no texto colado, na ordem, sem repetir.
 
@@ -437,9 +564,63 @@ class App(tk.Tk):
         self.status = ttk.Label(quadro, text="Pronto.", wraplength=488)
         self.status.pack(anchor="w")
 
+        # Rodapé: versão do yt-dlp em uso e aviso quando há uma mais nova
+        rodape = ttk.Frame(quadro)
+        rodape.pack(fill="x", pady=(10, 0))
+        ttk.Label(rodape, text=f"yt-dlp {yt_dlp.version.__version__}", foreground="gray").pack(side="left")
+        self.aviso = ttk.Label(rodape, text=AVISO_YT_DLP or "", foreground="#b35c00", wraplength=300)
+        self.aviso.pack(side="left", padx=8)
+        self.botao_atualizar = ttk.Button(rodape, text="Atualizar", command=self.instalar_atualizacao)
+        self.versao_nova = None
+        self.fila_atualizacao = queue.Queue()
+        self.em_segundo_plano(versao_nova_disponivel)
+
     @property
     def baixando(self):
         return self.atual is not None
+
+    def em_segundo_plano(self, tarefa, *args):
+        """Roda `tarefa` numa thread; o resultado (ou o erro) chega em ouvir_atualizacao."""
+        def rodar():
+            try:
+                self.fila_atualizacao.put((tarefa.__name__, tarefa(*args), None))
+            except Exception as e:
+                self.fila_atualizacao.put((tarefa.__name__, None, e))
+        threading.Thread(target=rodar, daemon=True).start()
+        self.after(200, self.ouvir_atualizacao)
+
+    def ouvir_atualizacao(self):
+        try:
+            tarefa, resultado, erro = self.fila_atualizacao.get_nowait()
+        except queue.Empty:
+            self.after(200, self.ouvir_atualizacao)
+            return
+        if tarefa == "versao_nova_disponivel":
+            # Sem internet ou PyPI fora do ar: não incomoda, só não avisa
+            if resultado:
+                self.versao_nova = resultado
+                self.aviso.config(text=f"Nova versão do yt-dlp: {resultado}")
+                self.botao_atualizar.pack(side="right")
+        elif tarefa == "instalar_yt_dlp":
+            if erro:
+                registrar_erro("atualização do yt-dlp", erro)
+                self.aviso.config(text="Não foi possível atualizar. Tente de novo mais tarde.")
+                self.botao_atualizar.config(text="Tentar de novo", state="normal")
+            else:
+                self.aviso.config(text=f"yt-dlp {self.versao_nova} instalado. Reinicie para usar.")
+                self.botao_atualizar.config(text="Reiniciar", command=self.reiniciar, state="normal")
+
+    def instalar_atualizacao(self):
+        self.botao_atualizar.config(state="disabled")
+        self.aviso.config(text=f"Baixando yt-dlp {self.versao_nova}...")
+        self.em_segundo_plano(instalar_yt_dlp, self.versao_nova)
+
+    def reiniciar(self):
+        if self.baixando:
+            self.status.config(text="Espere a fila terminar (ou cancele) para reiniciar.")
+            return
+        reiniciar_app()
+        self.destroy()
 
     def mostrar_pasta(self):
         texto = str(self.pasta)
