@@ -68,9 +68,10 @@ def pasta_padrao():
 def carregar_pasta():
     """Última pasta escolhida, ou a padrão se não houver uma salva ou ela não existir mais."""
     try:
-        pasta = Path(json.loads(ARQUIVO_CONFIG.read_text(encoding="utf-8"))["pasta"])
-        if pasta.is_dir():
-            return pasta
+        valor = json.loads(ARQUIVO_CONFIG.read_text(encoding="utf-8"))["pasta"]
+        # Vazio ou relativo viraria a pasta atual do processo, que sempre existe
+        if isinstance(valor, str) and valor and Path(valor).is_absolute() and Path(valor).is_dir():
+            return Path(valor)
     except (OSError, ValueError, KeyError, TypeError):
         pass
     return pasta_padrao()
