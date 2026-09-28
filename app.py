@@ -11,6 +11,17 @@ import yt_dlp
 
 PASTA_DOWNLOADS = Path.home() / "Downloads"
 
+SO_AUDIO = "Só áudio (MP3)"
+# Opção do menu -> altura máxima do vídeo (None = sem limite)
+QUALIDADES = {
+    "Melhor qualidade": None,
+    "1080p": 1080,
+    "720p": 720,
+    "480p": 480,
+    "360p": 360,
+    SO_AUDIO: None,
+}
+
 # No .exe sem console não existe stdout/stderr; o yt-dlp precisa de algum lugar para escrever
 if sys.stdout is None:
     sys.stdout = open(os.devnull, "w")
@@ -27,7 +38,34 @@ def caminho_deno():
     return deno.find_deno_bin()
 
 
-def baixar(url, fila):
+def opcoes_formato(qualidade):
+    """Opções do yt-dlp que dependem da qualidade escolhida no menu."""
+    if qualidade == SO_AUDIO:
+        return {
+            "format": "bestaudio/best",
+            # O ffmpeg converte o áudio baixado (m4a/webm) para MP3
+            "postprocessors": [{
+                "key": "FFmpegExtractAudio",
+                "preferredcodec": "mp3",
+                "preferredquality": "192",
+            }],
+        }
+    altura = QUALIDADES[qualidade]
+    filtro = f"[height<={altura}]" if altura else ""
+    # H.264 (avc1) primeiro porque abre em qualquer player. Na "Melhor qualidade" não,
+    # porque acima de 1080p o YouTube só oferece VP9/AV1 e o 4K seria ignorado.
+    preferir_h264 = f"bestvideo{filtro}[vcodec^=avc1]+bestaudio[ext=m4a]/" if altura else ""
+    return {
+        # O YouTube entrega vídeo e áudio separados; o ffmpeg junta os dois em um .mp4
+        "format": (
+            f"{preferir_h264}bestvideo{filtro}[ext=mp4]+bestaudio[ext=m4a]"
+            f"/bestvideo{filtro}+bestaudio/best{filtro}"
+        ),
+        "merge_output_format": "mp4",
+    }
+
+
+def baixar(url, fila, qualidade="Melhor qualidade"):
     """Baixa o vídeo de forma bloqueante, mandando atualizações para a interface pela fila.
 
     O chamador deve rodar esta função em uma thread separada. Sempre termina com
@@ -40,21 +78,26 @@ def baixar(url, fila):
             total = d.get("total_bytes") or d.get("total_bytes_estimate")
             if total:
                 pct = d["downloaded_bytes"] / total * 100
-                parte = "vídeo" if partes["atual"] == 0 else "áudio"
+                if qualidade == SO_AUDIO or partes["atual"] > 0:
+                    parte = "áudio"
+                else:
+                    parte = "vídeo"
                 fila.put(("progresso", pct, f"Baixando {parte}... {pct:.0f}%"))
         elif d["status"] == "finished":
             partes["atual"] += 1
 
     def pos_processamento(d):
-        if d["status"] == "started" and d["postprocessor"] == "Merger":
+        if d["status"] != "started":
+            return
+        if d["postprocessor"] == "Merger":
             fila.put(("progresso", 100, "Juntando vídeo e áudio..."))
+        elif d["postprocessor"] == "ExtractAudio":
+            fila.put(("progresso", 100, "Convertendo para MP3..."))
 
     try:
         fila.put(("progresso", 0, "Buscando informações do vídeo..."))
         ydl_opts = {
-            # O YouTube entrega vídeo e áudio separados; o ffmpeg junta os dois em um .mp4
-            "format": "bestvideo[ext=mp4]+bestaudio[ext=m4a]/bestvideo+bestaudio/best",
-            "merge_output_format": "mp4",
+            **opcoes_formato(qualidade),
             "ffmpeg_location": imageio_ffmpeg.get_ffmpeg_exe(),
             # Deno embutido resolve o JavaScript do YouTube, sem exigir nada instalado no PC
             "js_runtimes": {"deno": {"path": caminho_deno()}},
@@ -93,13 +136,16 @@ class App(tk.Tk):
 
         botoes = ttk.Frame(quadro)
         botoes.pack(fill="x")
+        self.qualidade = ttk.Combobox(botoes, values=list(QUALIDADES), state="readonly", width=18)
+        self.qualidade.current(0)
+        self.qualidade.pack(side="left")
         self.botao = ttk.Button(botoes, text="Baixar", command=self.iniciar)
-        self.botao.pack(side="left")
-        ttk.Button(botoes, text="Abrir pasta", command=self.abrir_pasta).pack(side="left", padx=8)
+        self.botao.pack(side="left", padx=8)
+        ttk.Button(botoes, text="Abrir pasta", command=self.abrir_pasta).pack(side="left")
 
         self.barra = ttk.Progressbar(quadro, maximum=100)
         self.barra.pack(fill="x", pady=(12, 4))
-        self.status = ttk.Label(quadro, text=f"Os vídeos são salvos em {PASTA_DOWNLOADS}")
+        self.status = ttk.Label(quadro, text=f"Os arquivos são salvos em {PASTA_DOWNLOADS}")
         self.status.pack(anchor="w")
 
     def abrir_pasta(self):
@@ -120,8 +166,10 @@ class App(tk.Tk):
         self.baixando = True
         self.botao.config(state="disabled")
         self.url.config(state="disabled")
+        self.qualidade.config(state="disabled")
         self.barra["value"] = 0
-        threading.Thread(target=baixar, args=(url, self.fila), daemon=True).start()
+        args = (url, self.fila, self.qualidade.get())
+        threading.Thread(target=baixar, args=args, daemon=True).start()
         self.after(100, self.atualizar)
 
     def atualizar(self):
@@ -136,6 +184,7 @@ class App(tk.Tk):
                     self.barra["value"] = 100 if valor else 0
                     self.botao.config(state="normal")
                     self.url.config(state="normal")
+                    self.qualidade.config(state="readonly")
                     self.baixando = False
                     return
         except queue.Empty:
