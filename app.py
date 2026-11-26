@@ -7,6 +7,7 @@ import re
 import shutil
 import subprocess
 import sys
+import tempfile
 import threading
 import tkinter as tk
 import urllib.request
@@ -77,6 +78,27 @@ def importar_yt_dlp():
 
 
 yt_dlp, PASTA_EM_USO, AVISO_YT_DLP = importar_yt_dlp()
+
+# Vídeos comuns baixados ao mesmo tempo; lives não contam (começam na hora)
+LIMITE_VIDEOS = 1
+
+# ffmpeg que está gravando uma live, por thread de download
+PROCESSOS_FFMPEG = {}
+
+
+def parar_gravacao(thread_id):
+    """Pede ao ffmpeg para encerrar a live gravando o que já baixou. False se não está gravando."""
+    proc = PROCESSOS_FFMPEG.get(thread_id)
+    if proc is None or proc.poll() is not None or proc.stdin is None:
+        return False
+    try:
+        # "q" é o jeito do ffmpeg de terminar limpo; matar o processo deixaria o arquivo quebrado
+        proc.stdin.write(b"q")
+        proc.stdin.flush()
+        return True
+    except OSError:
+        return False
+
 
 SO_AUDIO = "Só áudio (MP3)"
 # Opção do menu -> altura máxima do vídeo (None = sem limite)
@@ -472,15 +494,106 @@ def extrair_links(texto):
     return list(dict.fromkeys(links))
 
 
-def baixar(url, fila, qualidade="Melhor qualidade", pasta=None, cancelar=None):
+def texto_gravacao(estado):
+    """Ex.: 'Gravando ao vivo · 2:10 · 35.0 MB', a partir das linhas do -progress do ffmpeg."""
+    trechos = ["Gravando ao vivo"]
+    # Antes do primeiro pedaço o ffmpeg manda "N/A"
+    if estado.get("out_time_us", "").isdigit():
+        trechos.append(formatar_tempo(int(estado["out_time_us"]) / 1_000_000))
+    if estado.get("total_size", "").isdigit():
+        trechos.append(formatar_bytes(int(estado["total_size"])))
+    return " · ".join(trechos) + " · \"Parar e salvar\" encerra e guarda o que já foi gravado"
+
+
+def gravar_live(ydl, info, pasta, nome_base, so_audio, fila, cancelar):
+    """Grava a live com um ffmpeg do próprio app, até ela acabar ou o usuário clicar em Parar.
+
+    O yt-dlp só escolhe os formatos e descobre os endereços. O processo do ffmpeg fica com
+    o app, que lê o progresso e pode encerrá-lo limpo (parar_gravacao). Os argumentos de
+    entrada seguem os que o FFmpegFD do yt-dlp usa para lives.
+    """
+    ffmpeg = ydl.params["ffmpeg_location"]
+    gravacao = Path(pasta) / f"{nome_base}.ts.part"
+    final = Path(pasta) / f"{nome_base}.{'mp3' if so_audio else 'mp4'}"
+    sem_janela = getattr(subprocess, "CREATE_NO_WINDOW", 0)  # senão o .exe abre um console preto
+
+    formatos = info.get("requested_formats") or [info]
+    args = [ffmpeg, "-y", "-hide_banner", "-loglevel", "error", "-nostats", "-progress", "pipe:1"]
+    for fmt in formatos:
+        if re.match(r"https?://", fmt["url"]):
+            cookies = ydl.cookiejar.get_cookies_for_url(fmt["url"])
+            if cookies:
+                args += ["-cookies", "".join(
+                    f"{c.name}={c.value}; path={c.path}; domain={c.domain};\r\n" for c in cookies)]
+            cabecalhos = fmt.get("http_headers") or info.get("http_headers")
+            if cabecalhos:
+                args += ["-headers", "".join(f"{k}: {v}\r\n" for k, v in cabecalhos.items())]
+        args += (fmt.get("downloader_options") or {}).get("ffmpeg_args") or []
+        args += ["-i", fmt["url"]]
+    if info.get("requested_formats"):
+        # Vídeo e áudio vêm em endereços separados; o ffmpeg grava os dois juntos
+        for i, fmt in enumerate(formatos):
+            args += ["-map", f"{i}:{fmt.get('manifest_stream_number', 0)}"]
+    # MPEG-TS continua tocável mesmo se a gravação for interrompida de repente
+    args += ["-c", "copy", "-f", "mpegts", str(gravacao)]
+
+    with tempfile.TemporaryFile() as erros:
+        proc = subprocess.Popen(args, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=erros,
+                                creationflags=sem_janela)
+        PROCESSOS_FFMPEG[threading.get_ident()] = proc
+        estado = {}
+        for linha in proc.stdout:
+            chave, _, valor = linha.decode("utf-8", "replace").strip().partition("=")
+            estado[chave] = valor
+            if chave == "progress":  # última linha de cada bloco de progresso
+                if cancelar.is_set():
+                    proc.kill()
+                    break
+                fila.put(("progresso", 0, texto_gravacao(estado)))
+        codigo = proc.wait()
+        if cancelar.is_set():
+            raise yt_dlp.utils.DownloadCancelled()
+        if not gravacao.exists() or gravacao.stat().st_size == 0:
+            erros.seek(0)
+            raise RuntimeError(f"ffmpeg saiu com código {codigo} sem gravar nada: "
+                               + erros.read().decode("utf-8", "replace")[-2000:])
+        # Com algo gravado, guarda mesmo se a conexão caiu no meio: é melhor que perder tudo
+
+    fila.put(("sem_cancelar", None, None))
+    if so_audio:
+        fila.put(("progresso", 100, "Convertendo para MP3..."))
+        saida = ["-vn", "-c:a", "libmp3lame", "-b:a", "192k"]
+    else:
+        fila.put(("progresso", 100, "Convertendo a gravação para MP4..."))
+        saida = ["-map", "0", "-c", "copy", "-bsf:a", "aac_adtstoasc"]
+    resultado = subprocess.run(
+        [ffmpeg, "-y", "-hide_banner", "-loglevel", "error", "-i", str(gravacao), *saida, str(final)],
+        capture_output=True, creationflags=sem_janela)
+    if resultado.returncode != 0:
+        # Não perde a gravação: fica como .ts, que abre no VLC e na maioria dos players
+        final.unlink(missing_ok=True)
+        final = gravacao.replace(final.with_suffix(".ts"))
+    else:
+        gravacao.unlink()
+    return final
+
+
+def baixar(url, fila, qualidade="Melhor qualidade", pasta=None, cancelar=None,
+           desde_inicio=False, parar=None):
     """Baixa o vídeo de forma bloqueante, mandando atualizações para a interface pela fila.
 
     O chamador deve rodar esta função em uma thread separada. Sempre termina com
     uma mensagem ("fim", resultado, texto), com resultado "Concluído", "Cancelado" ou
     "Erro". Para cancelar, o chamador liga o threading.Event `cancelar`.
+
+    Com `desde_inicio`, uma live é baixada a partir do começo da transmissão; ligar o
+    Event `parar` encerra essa gravação guardando o que já foi baixado.
     """
     pasta = Path(pasta) if pasta else pasta_padrao()
     cancelar = cancelar or threading.Event()
+    parar = parar or threading.Event()
+    # Bytes já baixados de cada formato (vídeo e áudio) da live gravada desde o início
+    baixado_live = {}
     partes = {"atual": 0}
     # Preenchido logo antes do download: nome do vídeo e o que já estava na pasta
     limpeza = {"nome_base": None, "existentes": set()}
@@ -491,6 +604,18 @@ def baixar(url, fila, qualidade="Melhor qualidade", pasta=None, cancelar=None):
 
     def progresso(d):
         conferir_cancelamento()
+        if d.get("info_dict", {}).get("is_live"):
+            # Só chega aqui a live desde o início: a gravada pelo ffmpeg do app não usa ganchos.
+            # É o KeyboardInterrupt (não o DownloadCancelled) que faz o yt-dlp encerrar
+            # a live e juntar vídeo e áudio do que já baixou
+            if parar.is_set():
+                raise KeyboardInterrupt
+            if d["status"] == "downloading":
+                baixado_live[d["info_dict"].get("format_id")] = d.get("downloaded_bytes") or 0
+                fila.put(("progresso", 0, f"Gravando ao vivo desde o início · "
+                                          f"{formatar_bytes(sum(baixado_live.values()))} · "
+                                          f"\"Parar e salvar\" encerra e guarda o que já foi baixado"))
+            return
         if d["status"] == "downloading":
             if qualidade == SO_AUDIO or partes["atual"] > 0:
                 parte = "áudio"
@@ -523,6 +648,8 @@ def baixar(url, fila, qualidade="Melhor qualidade", pasta=None, cancelar=None):
             "js_runtimes": {"deno": {"path": caminho_deno()}},
             "outtmpl": str(pasta / "%(title)s.%(ext)s"),
             "noplaylist": True,
+            # Para lives do YouTube: baixa desde o começo da transmissão em vez de a partir de agora
+            "live_from_start": desde_inicio,
             "quiet": True,
             "no_warnings": True,
             "noprogress": True,
@@ -537,6 +664,7 @@ def baixar(url, fila, qualidade="Melhor qualidade", pasta=None, cancelar=None):
                 "titulo": info.get("title") or "Sem título",
                 "canal": info.get("uploader") or info.get("channel") or "",
                 "duracao": formatar_tempo(info["duration"]) if info.get("duration") else "",
+                "ao_vivo": bool(info.get("is_live")),
                 "imagem": None,
             }
             fila.put(("info", detalhes, "Baixando miniatura..."))
@@ -546,7 +674,16 @@ def baixar(url, fila, qualidade="Melhor qualidade", pasta=None, cancelar=None):
             # Foto da pasta antes de baixar, para o cancelamento só apagar o que for novo
             limpeza["nome_base"] = Path(ydl.prepare_filename(info)).stem
             limpeza["existentes"] = arquivos_na_pasta(pasta)
-            info = ydl.process_ie_result(info, download=True)
+            if detalhes["ao_vivo"] and not desde_inicio:
+                fila.put(("progresso", 0, "Começando a gravar a live..."))
+                gravar_live(ydl, info, pasta, limpeza["nome_base"], qualidade == SO_AUDIO, fila, cancelar)
+            else:
+                info = ydl.process_ie_result(info, download=True)
+                if detalhes["ao_vivo"]:
+                    # Live desde o início: o pedaço que baixava na hora do Parar fica pela metade
+                    for nome in arquivos_na_pasta(pasta) - limpeza["existentes"]:
+                        if nome.startswith(limpeza["nome_base"] + ".") and nome.endswith(".part"):
+                            (pasta / nome).unlink(missing_ok=True)
         # O clique em Cancelar pode chegar enquanto o ffmpeg roda, antes de o botão ser
         # desabilitado; nesse caso o cancelamento vale e o arquivo final também é apagado
         conferir_cancelamento()
@@ -560,6 +697,8 @@ def baixar(url, fila, qualidade="Melhor qualidade", pasta=None, cancelar=None):
             return
         registrar_erro(url, e)
         fila.put(("fim", "Erro", mensagem_erro(e)))
+    finally:
+        PROCESSOS_FFMPEG.pop(threading.get_ident(), None)
 
 
 class App(tb.App):
@@ -574,12 +713,12 @@ class App(tb.App):
             pass
         if "dark" in self.style.theme_use():
             barra_de_titulo_escura(self)
-        self.fila = queue.Queue()
         self.itens = {}  # id da linha na lista -> url, qualidade, pasta e mensagem final
         self.pendentes = []  # ids na ordem em que vão ser baixados
-        self.atual = None  # id do item que está baixando agora
+        # id -> fila, evento de cancelar, thread, se é live e o último progresso de cada download em andamento
+        self.ativos = {}
+        self.foco = None  # download mostrado na miniatura, na barra e no status
         self.resumo = {"Concluído": 0, "Erro": 0, "Cancelado": 0}
-        self.evento_cancelar = threading.Event()
         self.pasta = carregar_pasta()
 
         quadro = tb.Frame(self, padding=20)
@@ -622,6 +761,12 @@ class App(tb.App):
                        variable=self.colar_automatico, bootstyle="round-toggle",
                        command=lambda: salvar_config(colar_automatico=self.colar_automatico.get())
                        ).pack(anchor="w", pady=(10, 0))
+        # Desligado por padrão: alcançar o ao vivo a partir do começo pode demorar bastante
+        self.desde_inicio = tk.BooleanVar(value=carregar_config().get("live_desde_inicio") is True)
+        tb.Checkbutton(quadro, text="Gravar lives desde o começo (inclui o que já passou)",
+                       variable=self.desde_inicio, bootstyle="round-toggle",
+                       command=lambda: salvar_config(live_desde_inicio=self.desde_inicio.get())
+                       ).pack(anchor="w", pady=(6, 0))
         self.ultima_area_de_transferencia = None
         # Ao voltar para o app (ex.: depois de copiar o link no navegador) e ao abrir
         self.bind("<FocusIn>", self.colar_da_area_de_transferencia, add="+")
@@ -686,7 +831,7 @@ class App(tb.App):
 
     @property
     def baixando(self):
-        return self.atual is not None
+        return bool(self.ativos)
 
     def colar_da_area_de_transferencia(self, _evento=None):
         """Coloca na caixa os links do YouTube copiados, se forem novos.
@@ -795,13 +940,13 @@ class App(tb.App):
         if not links:
             self.status.config(text="Nenhum link encontrado. Cole o endereço completo do vídeo.")
             return
-        na_fila = {self.itens[i]["url"] for i in self.pendentes + [self.atual] if i}
+        na_fila = {self.itens[i]["url"] for i in self.pendentes + list(self.ativos)}
         novos = [link for link in links if link not in na_fila]
         # Qualidade e pasta valem a partir de agora; itens já na fila mantêm as deles
         for url in novos:
             iid = self.lista.insert("", "end", values=(url, self.qualidade.get(), "Na fila"))
             self.itens[iid] = {"url": url, "qualidade": self.qualidade.get(), "pasta": self.pasta,
-                               "mensagem": "Na fila."}
+                               "desde_inicio": self.desde_inicio.get(), "mensagem": "Na fila."}
             self.pendentes.append(iid)
         self.links.delete("1.0", "end")
 
@@ -809,42 +954,88 @@ class App(tb.App):
         if len(novos) < len(links):
             texto += f" {len(links) - len(novos)} já estava(m) na fila."
         self.status.config(text=texto)
-        if not self.baixando and novos:
-            self.resumo = dict.fromkeys(self.resumo, 0)
-            self.proximo()
+        if novos:
+            if not self.baixando:
+                self.resumo = dict.fromkeys(self.resumo, 0)
+            self.iniciar_pendentes()
 
-    def proximo(self):
-        if not self.pendentes:
-            self.atual = None
-            self.botao_cancelar.config(state="disabled")
+    def iniciar_pendentes(self):
+        """Começa os próximos da fila enquanto houver vaga; lives gravando não ocupam vaga."""
+        while self.pendentes and sum(not a["ao_vivo"] for a in self.ativos.values()) < LIMITE_VIDEOS:
+            self.comecar(self.pendentes.pop(0))
+        if not self.ativos and not self.pendentes:
+            self.botao_cancelar.config(state="disabled", text="Cancelar")
             partes = [f"{self.resumo['Concluído']} baixado(s)"]
             if self.resumo["Erro"]:
                 partes.append(f"{self.resumo['Erro']} com erro (clique no item para ver o motivo)")
             if self.resumo["Cancelado"]:
                 partes.append(f"{self.resumo['Cancelado']} cancelado(s)")
             self.status.config(text="Fila concluída: " + ", ".join(partes) + ".")
+
+    def comecar(self, iid):
+        item = self.itens[iid]
+        self.definir_estado(iid, "Começando...")
+        self.lista.see(iid)
+        fila, cancelar, parar = queue.Queue(), threading.Event(), threading.Event()
+        args = (item["url"], fila, item["qualidade"], item["pasta"], cancelar, item["desde_inicio"], parar)
+        thread = threading.Thread(target=baixar, args=args, daemon=True)
+        thread.start()
+        self.ativos[iid] = {"fila": fila, "cancelar": cancelar, "parar": parar, "thread": thread.ident,
+                            "ao_vivo": False, "gravando": False, "cancelavel": True, "parando": False, "detalhes": None, "valor": 0, "texto": "Começando..."}
+        self.focar(iid)
+        self.after(100, self.atualizar, iid)
+
+    def focar(self, iid):
+        """Mostra na parte de baixo da janela (miniatura, barra, status, Cancelar) este download."""
+        self.foco = iid
+        ativo = self.ativos[iid]
+        self.barra["value"] = ativo["valor"]
+        self.status.config(text=ativo["texto"])
+        if ativo["detalhes"]:
+            self.mostrar_info(ativo["detalhes"])
+        else:
+            self.quadro_info.pack_forget()
+        self.atualizar_botao_cancelar()
+
+    def atualizar_botao_cancelar(self):
+        ativo = self.ativos.get(self.foco)
+        if ativo is None:
+            self.botao_cancelar.config(state="disabled", text="Cancelar")
             return
-        self.atual = self.pendentes.pop(0)
-        item = self.itens[self.atual]
-        self.definir_estado(self.atual, "Começando...")
-        self.lista.see(self.atual)
-        self.botao_cancelar.config(state="normal")
-        self.barra["value"] = 0
-        self.quadro_info.pack_forget()
-        self.evento_cancelar = threading.Event()
-        args = (item["url"], self.fila, item["qualidade"], item["pasta"], self.evento_cancelar)
-        threading.Thread(target=baixar, args=args, daemon=True).start()
-        self.after(100, self.atualizar)
+        self.botao_cancelar.config(text="Parar e salvar" if ativo["ao_vivo"] else "Cancelar",
+                                   state="normal" if ativo["cancelavel"] else "disabled")
 
     def cancelar(self):
-        """Cancela só o vídeo atual; a fila continua com o próximo."""
-        self.evento_cancelar.set()
-        self.botao_cancelar.config(state="disabled")
-        self.status.config(text="Cancelando...")
+        """Cancela o download em foco (a live é encerrada e salva); os outros continuam."""
+        ativo = self.ativos.get(self.foco)
+        if ativo is None:
+            return
+        if ativo["ao_vivo"] and ativo["gravando"]:
+            ativo["parar"].set()  # live desde o início: o yt-dlp para no próximo pedaço
+            parar_gravacao(ativo["thread"])  # live gravada pelo ffmpeg do app
+            ativo["parando"] = True
+            ativo["texto"] = "Encerrando a gravação e salvando..."
+            self.definir_estado(self.foco, "Salvando...")
+        else:
+            # Live que ainda não começou a gravar é cancelada como um vídeo comum
+            ativo["cancelar"].set()
+            ativo["texto"] = "Cancelando..."
+        ativo["cancelavel"] = False
+        self.status.config(text=ativo["texto"])
+        self.atualizar_botao_cancelar()
+
+    def fechar(self):
+        # O ffmpeg é outro processo e continuaria gravando a live depois de a janela fechar
+        for proc in list(PROCESSOS_FFMPEG.values()):
+            try:
+                proc.kill()
+            except OSError:
+                pass
+        self.destroy()
 
     def remover_selecionados(self):
         for iid in self.lista.selection():
-            if iid == self.atual:
+            if iid in self.ativos:
                 continue  # o que está baixando se interrompe pelo Cancelar
             if iid in self.pendentes:
                 self.pendentes.remove(iid)
@@ -853,14 +1044,18 @@ class App(tb.App):
 
     def limpar_concluidos(self):
         for iid in list(self.itens):
-            if iid != self.atual and iid not in self.pendentes:
+            if iid not in self.ativos and iid not in self.pendentes:
                 self.itens.pop(iid)
                 self.lista.delete(iid)
 
     def mostrar_mensagem_item(self, _evento=None):
         selecao = self.lista.selection()
-        # Durante um download a linha de status mostra o progresso, que é mais útil
-        if len(selecao) == 1 and selecao[0] != self.atual and selecao[0] in self.itens:
+        if len(selecao) != 1:
+            return
+        if selecao[0] in self.ativos:
+            # Clicar num download em andamento mostra o progresso dele e liga o Cancelar a ele
+            self.focar(selecao[0])
+        elif selecao[0] in self.itens:
             self.status.config(text=self.itens[selecao[0]]["mensagem"])
 
     def mostrar_info(self, detalhes):
@@ -876,38 +1071,64 @@ class App(tb.App):
         # Fica logo acima da barra de progresso
         self.quadro_info.pack(fill="x", pady=(12, 0), before=self.barra)
 
-    def atualizar(self):
+    def atualizar(self, iid):
         # Só a thread principal pode mexer na interface do Tkinter
+        ativo = self.ativos[iid]
         try:
             while True:
-                tipo, valor, texto = self.fila.get_nowait()
+                tipo, valor, texto = ativo["fila"].get_nowait()
                 if tipo == "sem_cancelar":
-                    self.botao_cancelar.config(state="disabled")
+                    ativo["cancelavel"] = False
+                    if iid == self.foco:
+                        self.atualizar_botao_cancelar()
                     continue
+                cancelando = ativo["cancelar"].is_set() or ativo["parando"]
                 if tipo == "info":
-                    self.mostrar_info(valor)
-                    self.lista.set(self.atual, "video", valor["titulo"])
+                    ativo["detalhes"] = valor
+                    self.lista.set(iid, "video", valor["titulo"])
+                    if iid == self.foco:
+                        self.mostrar_info(valor)
+                    if valor["ao_vivo"] and not ativo["ao_vivo"]:
+                        ativo["ao_vivo"] = True
+                        if iid == self.foco:
+                            self.atualizar_botao_cancelar()
+                        self.iniciar_pendentes()  # a live grava por horas; o próximo já pode começar
                 elif tipo == "progresso":
-                    self.barra["value"] = valor
-                    etapa = "Finalizando..." if texto.startswith(("Juntando", "Convertendo")) else f"{valor:.0f}%"
-                    if not self.evento_cancelar.is_set():
-                        self.definir_estado(self.atual, etapa)
-                # Depois de pedir o cancelamento, não deixa o progresso apagar o "Cancelando..."
-                if not (self.evento_cancelar.is_set() and tipo != "fim"):
-                    self.status.config(text=texto)
+                    ativo["valor"] = valor
+                    if ativo["ao_vivo"] and texto.startswith("Gravando"):
+                        ativo["gravando"] = True
+                    if texto.startswith(("Juntando", "Convertendo")):
+                        etapa = "Finalizando..."
+                    else:
+                        etapa = "Ao vivo" if ativo["ao_vivo"] else f"{valor:.0f}%"
+                    # Depois de pedir para cancelar/parar, não deixa o progresso apagar o aviso
+                    if not cancelando:
+                        self.definir_estado(iid, etapa)
+                if tipo == "fim" or not cancelando:
+                    ativo["texto"] = texto
+                    if iid == self.foco:
+                        self.status.config(text=texto)
+                        self.barra["value"] = ativo["valor"]
                 if tipo == "fim":
                     # O resultado vem do próprio download: um clique em Cancelar depois que
                     # ele já terminou (antes de a janela ler esta mensagem) não muda nada
                     estado = valor
                     self.resumo[estado] += 1
-                    self.itens[self.atual]["mensagem"] = texto
-                    self.definir_estado(self.atual, estado)
-                    self.barra["value"] = 100 if estado == "Concluído" else 0
-                    self.proximo()
+                    self.itens[iid]["mensagem"] = texto
+                    self.definir_estado(iid, estado)
+                    del self.ativos[iid]
+                    if iid == self.foco:
+                        self.barra["value"] = 100 if estado == "Concluído" else 0
+                        self.foco = None
+                        self.atualizar_botao_cancelar()
+                    self.iniciar_pendentes()
+                    # Sem um novo começando, passa a mostrar outro que ainda está baixando
+                    if self.foco is None and self.ativos:
+                        self.focar(next(reversed(self.ativos)))
                     return
         except queue.Empty:
             pass
-        self.after(100, self.atualizar)
+        self.after(100, self.atualizar, iid)
 
 
 if __name__ == "__main__":
@@ -918,4 +1139,6 @@ if __name__ == "__main__":
         ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID("BaixarVideos.App")
     except (AttributeError, OSError):
         pass
-    App().mainloop()
+    app = App()
+    app.protocol("WM_DELETE_WINDOW", app.fechar)
+    app.mainloop()
