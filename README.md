@@ -20,9 +20,11 @@
 ## Funcionalidades
 
 - **Fila de downloads**: cole um ou vários links e eles são baixados um depois do outro
+- **Lives ao mesmo tempo**: cada live começa a gravar na hora, sem esperar a fila, e o botão **Parar e salvar** encerra a gravação guardando o que já foi baixado
+- **Live desde o começo** (opcional): com a chave "Gravar lives desde o começo" ligada, a live é baixada desde o início da transmissão, incluindo o que já passou
 - **Qualidade**: melhor disponível (até 4K), 1080p, 720p, 480p, 360p ou **só áudio (MP3)**
 - **Acompanhamento**: miniatura, título, velocidade, tamanho e tempo restante
-- **Cancelar** o vídeo atual sem parar a fila; os arquivos incompletos são apagados
+- **Cancelar** o vídeo selecionado sem parar a fila; os arquivos incompletos são apagados
 - **Salvar em...**: escolha a pasta de destino (o app lembra a última)
 - **Colar automático**: os links do YouTube que você copiar aparecem sozinhos no app
 - **Mensagens claras** quando algo dá errado (link inválido, vídeo privado, sem internet…)
